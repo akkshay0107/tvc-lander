@@ -2,12 +2,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-import torch
 from gym import PyEnvironment
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
-from src.ppo import PPOAgent
+from src.lqr import get_action
 
 
 def print_counter_table(counter: Counter):
@@ -30,34 +29,12 @@ def print_counter_table(counter: Counter):
         print(f"{key:<{max_key_len}}  {count:>{max_val_len}}")
 
 
-def select_action(agent, obs):
-    dist = agent.policy.get_dist(obs)
-    raw_action = dist.rsample()
-
-    action = raw_action.clamp(-1.0, 1.0)
-    logp = dist.log_prob(raw_action).sum(dim=-1)
-    return action, logp
-
-
 def run_test_episodes(
     max_steps: int = 3000,
     test_episodes: int = 100,
 ):
     env = PyEnvironment(max_steps)
-    agent = PPOAgent(env)
-
-    model_dir = "./models"
-    policy_net_path = Path(model_dir) / "policy_net.pth"
-    value_net_path = Path(model_dir) / "value_net.pth"
-
-    if not policy_net_path.exists() or not value_net_path.exists():
-        raise FileNotFoundError(
-            f"Saved models not found. Expected: {policy_net_path} and {value_net_path}"
-        )
-
-    agent.policy.load_state_dict(torch.load(policy_net_path))
-    agent.value.load_state_dict(torch.load(value_net_path))
-    print("Loaded saved policy and value networks. Running test episodes...")
+    env.tot_steps = int(1e6)
 
     rewards = []
     num_steps = []
@@ -72,7 +49,7 @@ def run_test_episodes(
         reason = "N/A"
 
         while not done:
-            action, _ = select_action(agent, obs)
+            action = get_action(obs)
             obs, reward, done, reason = env.step(action)
             total_reward += reward
             steps += 1
@@ -107,4 +84,4 @@ def run_test_episodes(
 
 
 if __name__ == "__main__":
-    run_test_episodes(test_episodes=1000)
+    run_test_episodes(test_episodes=100)

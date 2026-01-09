@@ -172,7 +172,7 @@ impl World {
         rocket_body.add_force(thrust_force_world, true);
 
         // Find torque on rocket body
-        let y_offset = ROCKET_HEIGHT_M / 4.0; // quarter height
+        let y_offset = ROCKET_HEIGHT_M / 2.0;
         let offset = (0.0, -y_offset);
         let thrust_force_body = (
             raw_thrust * raw_gimbal_angle.sin(),

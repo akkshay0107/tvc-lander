@@ -86,6 +86,11 @@ impl PyEnvironment {
         self.act_dim
     }
 
+    #[setter]
+    pub fn set_tot_steps(&mut self, tot_steps: u32) {
+        self.tot_steps = tot_steps;
+    }
+
     pub fn reset(&mut self) -> PyResult<[f32; 6]> {
         self.world = World::new();
         self.steps = 0;
