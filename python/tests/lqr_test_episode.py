@@ -2,11 +2,12 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
 from gym import PyEnvironment
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
-from src.lqr import get_action
+from src.lqr import LQR
 
 
 def print_counter_table(counter: Counter):
@@ -34,11 +35,15 @@ def run_test_episodes(
     test_episodes: int = 100,
 ):
     env = PyEnvironment(max_steps)
-    env.tot_steps = int(1e6)
+    env.tot_steps = int(1e6)  # get out of curriculum training zone
 
     rewards = []
     num_steps = []
     reasons = Counter()
+
+    Q = np.diag([10, 10, 100, 1, 1, 10])
+    R = np.diag([0.1, 0.1])
+    controller = LQR(Q, R)
 
     for i in range(test_episodes):
         obs = env.reset()
@@ -49,7 +54,7 @@ def run_test_episodes(
         reason = "N/A"
 
         while not done:
-            action = get_action(obs)
+            action = controller.get_action(obs)
             obs, reward, done, reason = env.step(action)
             total_reward += reward
             steps += 1
