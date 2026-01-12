@@ -2,12 +2,14 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 from gym import PyEnvironment
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 from src.ppo import PPOAgent
+from src.render import Renderer
 
 
 def print_counter_table(counter: Counter):
@@ -62,6 +64,7 @@ def run_test_episodes(
     rewards = []
     num_steps = []
     reasons = Counter()
+    renderer = Renderer()
 
     for i in range(test_episodes):
         obs = env.reset()
@@ -74,6 +77,7 @@ def run_test_episodes(
         while not done:
             action, _ = select_action(agent, obs)
             obs, reward, done, reason = env.step(action)
+            renderer.render(env.render_info())
             total_reward += reward
             steps += 1
 
@@ -108,3 +112,5 @@ def run_test_episodes(
 
 if __name__ == "__main__":
     run_test_episodes(test_episodes=1000)
+    plt.ioff()
+    plt.show()

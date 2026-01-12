@@ -3,6 +3,7 @@ use std::f32::consts::{PI, SQRT_2};
 use base::constants::*;
 use base::world::World;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use rand::Rng;
 use rapier2d::na::Isometry2;
 use rapier2d::prelude::*;
@@ -287,6 +288,17 @@ impl PyEnvironment {
             EpisodeStatus::InProgress
         };
         (status.as_str(), status != EpisodeStatus::InProgress)
+    }
+
+    pub fn render_info(&self, py: Python) -> PyResult<PyObject> {
+        let (rocket_x, rocket_y, rocket_angle) = self.world.get_rocket_state();
+
+        let state_dict = PyDict::new_bound(py);
+        state_dict.set_item("rocket_x", rocket_x)?;
+        state_dict.set_item("rocket_y", rocket_y)?;
+        state_dict.set_item("rocket_angle", rocket_angle)?;
+
+        Ok(state_dict.into())
     }
 }
 

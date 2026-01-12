@@ -2,12 +2,14 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 from gym import PyEnvironment
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 from src.lqr import LQR
+from src.render import Renderer
 
 
 def print_counter_table(counter: Counter):
@@ -40,6 +42,7 @@ def run_test_episodes(
     rewards = []
     num_steps = []
     reasons = Counter()
+    renderer = Renderer()
 
     Q = np.diag([10, 10, 100, 1, 1, 10])
     R = np.diag([0.1, 0.1])
@@ -56,6 +59,7 @@ def run_test_episodes(
         while not done:
             action = controller.get_action(obs)
             obs, reward, done, reason = env.step(action)
+            renderer.render(env.render_info())
             total_reward += reward
             steps += 1
 
@@ -90,3 +94,5 @@ def run_test_episodes(
 
 if __name__ == "__main__":
     run_test_episodes(test_episodes=100)
+    plt.ioff()
+    plt.show()
