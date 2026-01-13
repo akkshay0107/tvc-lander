@@ -2,7 +2,6 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from gym import PyEnvironment
@@ -94,8 +93,4 @@ def run_test_episodes(
 
 
 if __name__ == "__main__":
-    render = False
-    run_test_episodes(test_episodes=100, render=render)
-    if render:
-        plt.ioff()
-        plt.show()
+    run_test_episodes(test_episodes=100, render=True)
