@@ -4,6 +4,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
 from gym import PyEnvironment
 
 project_root = Path(__file__).resolve().parent.parent
@@ -33,8 +34,7 @@ def print_counter_table(counter: Counter):
 
 
 def run_test_episodes(
-    max_steps: int = 3000,
-    test_episodes: int = 100,
+    max_steps: int = 3000, test_episodes: int = 100, render: bool = False
 ):
     env = PyEnvironment(max_steps)
     env.tot_steps = int(1e6)  # get out of curriculum training zone
@@ -42,7 +42,7 @@ def run_test_episodes(
     rewards = []
     num_steps = []
     reasons = Counter()
-    renderer = Renderer()
+    renderer = Renderer() if render else None
 
     Q = np.diag([10, 10, 100, 1, 1, 10])
     R = np.diag([0.1, 0.1])
@@ -59,7 +59,8 @@ def run_test_episodes(
         while not done:
             action = controller.get_action(obs)
             obs, reward, done, reason = env.step(action)
-            renderer.render(env.render_info())
+            if render:
+                renderer.render(env.render_info())
             total_reward += reward
             steps += 1
 
@@ -93,6 +94,8 @@ def run_test_episodes(
 
 
 if __name__ == "__main__":
-    run_test_episodes(test_episodes=100)
-    plt.ioff()
-    plt.show()
+    render = False
+    run_test_episodes(test_episodes=100, render=render)
+    if render:
+        plt.ioff()
+        plt.show()

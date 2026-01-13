@@ -4,6 +4,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
+
 from gym import PyEnvironment
 
 project_root = Path(__file__).resolve().parent.parent
@@ -33,17 +34,17 @@ def print_counter_table(counter: Counter):
 
 
 def select_action(agent, obs):
-    dist = agent.policy.get_dist(obs)
+    obs_t = torch.tensor(obs).unsqueeze(0)
+    dist = agent.policy.get_dist(obs_t)
     raw_action = dist.rsample()
 
     action = raw_action.clamp(-1.0, 1.0)
     logp = dist.log_prob(raw_action).sum(dim=-1)
-    return action, logp
+    return action.squeeze(0).detach().numpy(), logp
 
 
 def run_test_episodes(
-    max_steps: int = 3000,
-    test_episodes: int = 100,
+    max_steps: int = 3000, test_episodes: int = 100, render: bool = False
 ):
     env = PyEnvironment(max_steps)
     agent = PPOAgent(env)
@@ -61,10 +62,12 @@ def run_test_episodes(
     agent.value.load_state_dict(torch.load(value_net_path))
     print("Loaded saved policy and value networks. Running test episodes...")
 
+    env.tot_steps = int(1e6)  # get out of curriculum training zone
+
     rewards = []
     num_steps = []
     reasons = Counter()
-    renderer = Renderer()
+    renderer = Renderer() if render else None
 
     for i in range(test_episodes):
         obs = env.reset()
@@ -77,7 +80,8 @@ def run_test_episodes(
         while not done:
             action, _ = select_action(agent, obs)
             obs, reward, done, reason = env.step(action)
-            renderer.render(env.render_info())
+            if render:
+                renderer.render(env.render_info())
             total_reward += reward
             steps += 1
 
@@ -111,6 +115,8 @@ def run_test_episodes(
 
 
 if __name__ == "__main__":
-    run_test_episodes(test_episodes=1000)
-    plt.ioff()
-    plt.show()
+    render = False
+    run_test_episodes(test_episodes=100, render=render)
+    if render:
+        plt.ioff()
+        plt.show()
