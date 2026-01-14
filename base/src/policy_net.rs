@@ -60,7 +60,7 @@ impl PolicyNet {
         let (mean, _) = self.forward(input, input_shape)?;
 
         // Apply tanh to mean
-        let action: Vec<f32> = mean.into_iter().map(|x| x.clamp(-1.0, 1.0)).collect();
+        let action: Vec<f32> = mean.into_iter().map(|x| x.tanh()).collect();
         Ok(action)
     }
 }

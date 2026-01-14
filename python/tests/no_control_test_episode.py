@@ -1,5 +1,6 @@
 from gym import PyEnvironment
 
+
 def main():
     env = PyEnvironment(10000)
     # Test episode
@@ -9,7 +10,7 @@ def main():
     tot_rew = 0
     while not done:
         action = [0, 0]
-        obs, reward, done = env.step(action)
+        obs, reward, done, _ = env.step(action)
         thrust = action
         print(f"{step=} {obs=} {thrust=} {reward=}")
         tot_rew += reward
@@ -17,6 +18,7 @@ def main():
 
     print("Test episode completed.")
     print(f"Total Reward: {tot_rew}")
+
 
 if __name__ == "__main__":
     main()

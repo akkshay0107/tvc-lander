@@ -1,9 +1,11 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from gym import PyEnvironment
-from torch.distributions import Normal
+from torch.distributions import Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
 from torch.optim import Adam
+
+from gym import PyEnvironment
 
 
 def _init_layer(linear: nn.Linear, gain: float):
@@ -12,7 +14,7 @@ def _init_layer(linear: nn.Linear, gain: float):
 
 
 class PolicyNet(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden_dim=128):
+    def __init__(self, obs_dim, act_dim, hidden_dim=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
@@ -21,7 +23,7 @@ class PolicyNet(nn.Module):
             nn.Tanh(),
         )
         self.mean_layer = nn.Linear(hidden_dim, act_dim)
-        self.log_std = nn.Parameter(-1.0 * torch.ones(act_dim))  # std is learnable
+        self.log_std = nn.Parameter(torch.zeros(act_dim))  # std is learnable
 
         gain = nn.init.calculate_gain("tanh")
         for layer in self.net:
@@ -38,7 +40,7 @@ class PolicyNet(nn.Module):
 
     def get_dist(self, obs):
         mean, std = self.forward(obs)
-        return Normal(mean, std)
+        return TransformedDistribution(Normal(mean, std), [TanhTransform(cache_size=1)])
 
 
 class ValueNet(nn.Module):
@@ -68,10 +70,11 @@ class PPOAgent:
         gamma=0.995,
         lam=0.95,
         clip_eps=0.2,
-        lr=1e-4,
-        epochs=4,
-        batch_size=512,
-        ent_coef=1e-5,
+        lr=3e-4,
+        epochs=10,
+        batch_size=256,
+        ent_coef=5e-3,
+        target_kl=0.02,
         device="cpu",
     ):
         self.env = env
@@ -81,12 +84,17 @@ class PPOAgent:
         self.epochs = epochs
         self.batch_size = batch_size
         self.ent_coef = ent_coef
+        self.target_kl = target_kl
 
         self.device = torch.device(device)
         self.policy = PolicyNet(self.env.obs_dim, self.env.act_dim).to(self.device)
         self.value = ValueNet(self.env.obs_dim).to(self.device)
-        self.policy_optim = Adam(self.policy.parameters(), lr=lr)
-        self.value_optim = Adam(self.value.parameters(), lr=lr)
+        self.optim = Adam(
+            [
+                {"params": self.policy.parameters(), "lr": lr},
+                {"params": self.value.parameters(), "lr": lr},
+            ]
+        )
 
     def _compute_gae(self, rewards, values, next_values, bootstrap_mask, dones):
         T = rewards.shape[0]
@@ -120,9 +128,8 @@ class PPOAgent:
             dist = self.policy.get_dist(obs_t)
             v = self.value(obs_t).item()
 
-            raw_action = dist.rsample()
-            action = raw_action.clamp(-1.0, 1.0)
-            logp = dist.log_prob(raw_action).sum(dim=-1)
+            action = dist.rsample()
+            logp = dist.log_prob(action).sum(dim=-1)
 
             action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
             next_obs, reward, done, reason = self.env.step(action_np)
@@ -134,7 +141,7 @@ class PPOAgent:
             v_next = self.value(next_obs_t).item()
 
             obs_buf[t] = obs
-            act_buf[t] = raw_action
+            act_buf[t] = action
             logp_buf[t] = logp
             rew_buf[t] = reward
             done_buf[t] = done
@@ -192,9 +199,16 @@ class PPOAgent:
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std(unbiased=False) + 1e-8)
 
             n = obs_t.shape[0]
-            avg_pi_loss, avg_v_loss, avg_entropy, num_batches = 0.0, 0.0, 0.0, 0
+            avg_pi_loss, avg_v_loss, avg_entropy, avg_kl, num_batches = (
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0,
+            )
 
-            for _ in range(self.epochs):
+            for epoch in range(self.epochs):
+                early_stop = False
                 idx = torch.randperm(n, device=self.device)
                 for start in range(0, n, self.batch_size):
                     b = idx[start : start + self.batch_size]
@@ -206,7 +220,9 @@ class PPOAgent:
 
                     dist = self.policy.get_dist(obs_mb)
                     logp = dist.log_prob(act_mb).sum(dim=-1)
-                    entropy = dist.entropy().sum(dim=-1)
+                    entropy = dist.base_dist.entropy().sum(
+                        dim=-1
+                    )  # use base normal dist as proxy
 
                     ratio = torch.exp(logp - logp_old_mb)
                     surr1 = ratio * adv_mb
@@ -219,30 +235,47 @@ class PPOAgent:
                         - self.ent_coef * entropy.mean()
                     )
 
-                    self.policy_optim.zero_grad(set_to_none=True)
-                    pi_loss.backward()
-                    nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-                    self.policy_optim.step()
-
                     value = self.value(obs_mb)
                     value_loss = nn.MSELoss()(value, ret_mb)
 
-                    self.value_optim.zero_grad(set_to_none=True)
-                    value_loss.backward()
-                    nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
-                    self.value_optim.step()
+                    loss = pi_loss + 0.5 * value_loss
+
+                    self.optim.zero_grad(set_to_none=True)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.policy.parameters()) + list(self.value.parameters()),
+                        0.5,
+                    )
+                    self.optim.step()
+
+                    with torch.no_grad():
+                        kl = (logp_old_mb - logp).mean()
 
                     avg_pi_loss += pi_loss.item()
                     avg_v_loss += value_loss.item()
                     avg_entropy += entropy.mean().item()
+                    avg_kl += kl.item()
                     num_batches += 1
+
+                    if (
+                        self.target_kl is not None
+                        and (avg_kl / num_batches) > self.target_kl
+                    ):
+                        early_stop = True
+                        break
+
+                if early_stop:
+                    print(f"Early stopping at epoch {epoch + 1}.")
+                    break
 
             avg_pi_loss /= num_batches
             avg_v_loss /= num_batches
             avg_entropy /= num_batches
+            avg_kl /= num_batches
+
             print(
                 f"Rollout: {time}, Policy Loss: {avg_pi_loss:.3f}, Value Loss: {avg_v_loss:.3f}, "
-                f"Average Reward: {rew_t.mean(dim=-1):.3f}, Average Entropy: {avg_entropy:.3f}"  # type: ignore
+                f"Avg Reward: {rew_t.mean(dim=-1):.3f}, Avg Entropy: {avg_entropy:.3f}, Avg KL Div: {avg_kl:.3f}"  # type: ignore
             )
 
             if time % 100 == 0:
@@ -256,19 +289,10 @@ def main():
 
     os.makedirs("./models", exist_ok=True)
 
-    # constants
     MAX_STEPS = 8192
     NUM_ROLLOUTS = 300
-
     env = PyEnvironment(MAX_STEPS)
     agent = PPOAgent(env)
-
-    # optionally load old dicts before training
-    # state_dict = torch.load("./models/policy_net.pth", map_location=agent.device)
-    # agent.policy.load_state_dict(state_dict)
-
-    # state_dict = torch.load("./models/value_net.pth", map_location=agent.device)
-    # agent.value.load_state_dict(state_dict)
 
     print("Training started.")
     agent.train(NUM_ROLLOUTS)

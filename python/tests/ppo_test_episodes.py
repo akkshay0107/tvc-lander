@@ -3,11 +3,13 @@ from collections import Counter
 from pathlib import Path
 
 import torch
+
 from gym import PyEnvironment
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 from src.ppo import PPOAgent
+from src.render import Renderer
 
 
 def print_counter_table(counter: Counter):
@@ -31,17 +33,16 @@ def print_counter_table(counter: Counter):
 
 
 def select_action(agent, obs):
-    dist = agent.policy.get_dist(obs)
-    raw_action = dist.rsample()
+    obs_t = torch.tensor(obs).unsqueeze(0)
+    dist = agent.policy.get_dist(obs_t)
 
-    action = raw_action.clamp(-1.0, 1.0)
-    logp = dist.log_prob(raw_action).sum(dim=-1)
-    return action, logp
+    action = dist.rsample()
+    logp = dist.log_prob(action).sum(dim=-1)
+    return action.squeeze(0).detach().numpy(), logp
 
 
 def run_test_episodes(
-    max_steps: int = 3000,
-    test_episodes: int = 100,
+    max_steps: int = 3000, test_episodes: int = 100, render: bool = False
 ):
     env = PyEnvironment(max_steps)
     agent = PPOAgent(env)
@@ -57,15 +58,20 @@ def run_test_episodes(
 
     agent.policy.load_state_dict(torch.load(policy_net_path))
     agent.value.load_state_dict(torch.load(value_net_path))
+    agent.policy.eval()
+    agent.value.eval()
     print("Loaded saved policy and value networks. Running test episodes...")
+
+    env.tot_steps = int(1e6)  # get out of curriculum training zone
 
     rewards = []
     num_steps = []
     reasons = Counter()
+    renderer = Renderer() if render else None
 
     for i in range(test_episodes):
         obs = env.reset()
-        start_state = [x for x in obs]  # deep-ish copy for printing
+        start_state = [x for x in obs]
         done = False
         total_reward = 0.0
         steps = 0
@@ -74,6 +80,8 @@ def run_test_episodes(
         while not done:
             action, _ = select_action(agent, obs)
             obs, reward, done, reason = env.step(action)
+            if render:
+                renderer.render(env.render_info())
             total_reward += reward
             steps += 1
 
@@ -107,4 +115,4 @@ def run_test_episodes(
 
 
 if __name__ == "__main__":
-    run_test_episodes(test_episodes=1000)
+    run_test_episodes(test_episodes=100, render=False)

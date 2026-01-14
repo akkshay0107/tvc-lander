@@ -12,6 +12,7 @@ pub const MAX_LANDING_VY: f32 = 0.7;
 pub const MAX_LANDING_ANGULAR_VELOCITY: f32 = 0.05;
 
 pub const MAX_GIMBAL_ANGLE: f32 = PI / 12.0; // 15 degress
+pub const MAX_THRUST: f32 = 20.0; // Thruster can offset gravity
 
 pub const ROCKET_WIDTH_M: f32 = 2.0;
 pub const ROCKET_HEIGHT_M: f32 = 4.0;
