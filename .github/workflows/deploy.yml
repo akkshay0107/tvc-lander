@@ -30,8 +30,6 @@ jobs:
       - name: Build wasm
         run: |
           chmod +x build_wasm.sh
-          # IMPORTANT: The argument 'controlled_sim' MUST match the name
-          # in your Cargo.toml [bin] section, or the script will fail.
           ./build_wasm.sh controlled_sim --release
 
       - name: Setup Pages

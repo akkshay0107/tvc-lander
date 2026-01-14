@@ -8,16 +8,14 @@
 use macroquad::prelude::*;
 use rapier2d::prelude::*;
 
-use crate::constants::{MAX_GIMBAL_ANGLE, ROCKET_HEIGHT_M, ROCKET_WIDTH_M};
+use crate::constants::{MAX_GIMBAL_ANGLE, MAX_THRUST, ROCKET_HEIGHT_M, ROCKET_WIDTH_M};
 
 const GROUND_RESTITUTION: f32 = 0.5;
 const ROCKET_RESTITUTION: f32 = 0.1;
 const ROCKET_MASS: f32 = 1.0;
 const GROUND_SIZE: Vector<f32> = vector![40.0, 6.0];
-const ANGULAR_DRAG_COEFFICIENT: f32 = 2.0;
-const LINEAR_DRAG_COEFFICIENT: f32 = 1.5;
-
-pub const MAX_THRUST: f32 = 15.0; // Thruster can offset gravity
+const ANGULAR_DRAG_COEFFICIENT: f32 = 2.5;
+const LINEAR_DRAG_COEFFICIENT: f32 = 1.75;
 
 const TOLERANCE_RADIUS: f32 = 1.5; // Set to the average of the dimensions of the rocket body
 

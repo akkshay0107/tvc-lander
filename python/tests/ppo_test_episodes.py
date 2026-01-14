@@ -35,10 +35,9 @@ def print_counter_table(counter: Counter):
 def select_action(agent, obs):
     obs_t = torch.tensor(obs).unsqueeze(0)
     dist = agent.policy.get_dist(obs_t)
-    raw_action = dist.rsample()
 
-    action = raw_action.clamp(-1.0, 1.0)
-    logp = dist.log_prob(raw_action).sum(dim=-1)
+    action = dist.rsample()
+    logp = dist.log_prob(action).sum(dim=-1)
     return action.squeeze(0).detach().numpy(), logp
 
 
@@ -59,6 +58,8 @@ def run_test_episodes(
 
     agent.policy.load_state_dict(torch.load(policy_net_path))
     agent.value.load_state_dict(torch.load(value_net_path))
+    agent.policy.eval()
+    agent.value.eval()
     print("Loaded saved policy and value networks. Running test episodes...")
 
     env.tot_steps = int(1e6)  # get out of curriculum training zone

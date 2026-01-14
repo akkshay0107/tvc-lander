@@ -156,7 +156,7 @@ impl PyEnvironment {
 
         let potential = 0.5 * dist_score + 0.2 * angle_score + 0.3 * speed_score;
 
-        5.0 * potential
+        100.0 * potential
     }
 
     fn calculate_reward(
@@ -173,7 +173,7 @@ impl PyEnvironment {
         self.prev_potential = current_potential;
 
         let mut terminal_reward = 0.0;
-        let base_success = 20.0;
+        let base_success = 100.0;
 
         if self._is_crash_landing(x, y, theta, vx, vy, omega) || self._is_oob(x, y) {
             terminal_reward = -base_success;
@@ -182,7 +182,7 @@ impl PyEnvironment {
             terminal_reward = base_success * (-2.0 * ndx.powi(2)).exp(); // gaussian reward
         }
 
-        let time_penalty = 1e-4;
+        let time_penalty = 5e-3;
         shaping_reward + terminal_reward - time_penalty
     }
 
@@ -203,16 +203,16 @@ impl PyEnvironment {
 
         let center_x = MAX_POS_X / 2.0;
 
-        let (spawn_width, box_bottom, box_top) = if self.tot_steps < 50_000 {
+        let (spawn_width, box_bottom, box_top) = if self.tot_steps < 100_000 {
             (0.0, 5.0, 5.0)
-        } else if self.tot_steps < 150_000 {
+        } else if self.tot_steps < 250_000 {
             (5.0, 10.0, 20.0)
         } else if self.tot_steps < 500_000 {
             (10.0, 15.0, 30.0)
         } else if self.tot_steps < 1_000_000 {
             (20.0, 20.0, 35.0)
         } else {
-            (30.0, 30.0, 40.0)
+            (35.0, 20.0, 42.0)
         };
 
         let box_left = center_x - spawn_width;
