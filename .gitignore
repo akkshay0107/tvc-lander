@@ -2,6 +2,7 @@
 .*
 __pycache__
 /dist
+*.log
+*.pth
 !.github
 !.gitignore
-training_log*
