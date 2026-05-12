@@ -1,75 +1,21 @@
 import os
+from collections import deque
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Normal, TransformedDistribution
-from torch.distributions.transforms import TanhTransform
 from torch.optim import Adam
 
 from curriculum import BoxBound, CurriculumManager
 from gym import PyEnvironment
-
-
-def _init_layer(linear: nn.Linear, gain: float):
-    nn.init.orthogonal_(linear.weight, gain)  # type: ignore
-    nn.init.constant_(linear.bias, 0.0)
-
-
-class PolicyNet(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden_dim=256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-        )
-        self.mean_layer = nn.Linear(hidden_dim, act_dim)
-        self.log_std = nn.Parameter(torch.zeros(act_dim))  # std is learnable
-
-        gain = nn.init.calculate_gain("tanh")
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                _init_layer(layer, gain)
-
-        _init_layer(self.mean_layer, 0.01)
-
-    def forward(self, obs):
-        x = self.net(obs)
-        mean = self.mean_layer(x)
-        std = self.log_std.clamp(-20, 2).exp()
-        return mean, std
-
-    def get_dist(self, obs):
-        mean, std = self.forward(obs)
-        return TransformedDistribution(Normal(mean, std), [TanhTransform(cache_size=1)])
-
-
-class ValueNet(nn.Module):
-    def __init__(self, obs_dim, hidden_dim=256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-        gain = nn.init.calculate_gain("tanh")
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                _init_layer(layer, gain)
-
-    def forward(self, obs):
-        return self.net(obs).squeeze(-1)
+from policy import PolicyNet, ValueNet
 
 
 class PPOAgent:
     def __init__(
         self,
         env,
+        n_frames=4,
         gamma=0.995,
         lam=0.95,
         clip_eps=0.2,
@@ -81,6 +27,7 @@ class PPOAgent:
         device="cpu",
     ):
         self.env = env
+        self.n_frames = n_frames
         self.gamma = gamma
         self.lam = lam
         self.clip_eps = clip_eps
@@ -90,8 +37,10 @@ class PPOAgent:
         self.target_kl = target_kl
 
         self.device = torch.device(device)
-        self.policy = PolicyNet(self.env.obs_dim, self.env.act_dim).to(self.device)
-        self.value = ValueNet(self.env.obs_dim).to(self.device)
+        self.policy = PolicyNet(
+            self.env.obs_dim, self.env.act_dim, n_frames=n_frames
+        ).to(self.device)
+        self.value = ValueNet(self.env.obs_dim, n_frames=n_frames).to(self.device)
         self.optim = Adam(
             [
                 {"params": self.policy.parameters(), "lr": lr},
@@ -111,10 +60,26 @@ class PPOAgent:
             adv[t] = gae
         return adv
 
+    def _get_stacked_obs(self, obs_list, frame_buffers):
+        stacked = []
+        for i, obs in enumerate(obs_list):
+            buffer = frame_buffers[i]
+            if len(buffer) == 0:
+                for _ in range(self.n_frames):
+                    buffer.append(obs)
+            else:
+                buffer.append(obs)
+            stacked.append(np.concatenate(list(buffer)))
+        return np.array(stacked, dtype=np.float32)
+
     @torch.no_grad()
     def collect_trajectories(self, horizon=2048):
         group_size = self.env.group_size
         obs = self.env.reset()  # Vec of observations
+
+        # Initialize frame buffers for stacking
+        frame_buffers = [deque(maxlen=self.n_frames) for _ in range(group_size)]
+        stacked_obs = self._get_stacked_obs(obs, frame_buffers)
 
         # Per-agent buffers
         obs_bufs = [[] for _ in range(group_size)]
@@ -133,7 +98,9 @@ class PPOAgent:
             if all(agent_dones):
                 break
 
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+            obs_tensor = torch.as_tensor(
+                stacked_obs, dtype=torch.float32, device=self.device
+            )
             dist = self.policy.get_dist(obs_tensor)
             values = self.value(obs_tensor)
 
@@ -143,14 +110,17 @@ class PPOAgent:
             actions_np = actions.cpu().numpy().astype(np.float32)
             next_obs, rewards, next_dones, reasons = self.env.step(actions_np.tolist())
 
+            # Prepare next stacked observation
+            next_stacked_obs = self._get_stacked_obs(next_obs, frame_buffers)
+
             next_obs_tensor = torch.as_tensor(
-                next_obs, dtype=torch.float32, device=self.device
+                next_stacked_obs, dtype=torch.float32, device=self.device
             )
             next_values = self.value(next_obs_tensor)
 
             for i in range(group_size):
                 if not agent_dones[i]:
-                    obs_bufs[i].append(obs[i])
+                    obs_bufs[i].append(stacked_obs[i])
                     act_bufs[i].append(actions_np[i])
                     logp_bufs[i].append(logps[i].item())
                     rew_bufs[i].append(rewards[i])
@@ -164,8 +134,10 @@ class PPOAgent:
                         agent_dones[i] = True
                         if reasons[i] == "success":
                             success_count += 1
+                        # Reset frame buffer for this agent if it were to continue,
+                        # but here we just stop collecting for it.
 
-            obs = next_obs
+            stacked_obs = next_stacked_obs
 
         # Flatten all buffers
         flat_obs, flat_act, flat_logp, flat_adv, flat_ret = [], [], [], [], []
@@ -174,7 +146,6 @@ class PPOAgent:
             if not obs_bufs[i]:
                 continue
 
-            # Compute GAE for this agent's trajectory
             r = torch.tensor(rew_bufs[i], device=self.device)
             v = torch.tensor(val_bufs[i], device=self.device)
             vn = torch.tensor(val_next_bufs[i], device=self.device)
@@ -214,7 +185,6 @@ class PPOAgent:
             adv_t = torch.as_tensor(adv_b, dtype=torch.float32, device=self.device)
             ret_t = torch.as_tensor(ret_b, dtype=torch.float32, device=self.device)
 
-            # Standardize advantages
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
             n = obs_t.shape[0]
@@ -288,7 +258,6 @@ class PPOAgent:
             avg_entropy /= num_batches
             avg_kl /= num_batches
 
-            # Update curriculum
             curriculum.update_metrics(success_count, self.env.group_size)
 
             print(
@@ -308,26 +277,24 @@ def main():
     MAX_STEPS = 2000
     GROUP_SIZE = 32
     NUM_ROLLOUTS = 2000
+    N_FRAMES = 4
 
     env = PyEnvironment(MAX_STEPS, GROUP_SIZE)
 
     tasks = [
-        # Level 0: Vertical drop, close to ground
         BoxBound(40.0, 40.0, 5.0, 10.0, 0.0, 0.0),
-        # Level 1: Small angle variance
         BoxBound(40.0, 40.0, 10.0, 20.0, -0.1, 0.1),
-        # Level 2: Small X variance
         BoxBound(30.0, 50.0, 20.0, 30.0, -0.2, 0.2),
-        # Level 3: Larger angle variance
         BoxBound(20.0, 60.0, 30.0, 40.0, -0.3, 0.3),
-        # Level 4: Full range
         BoxBound(10.0, 70.0, 30.0, 40.0, -0.5, 0.5),
     ]
     curriculum = CurriculumManager(env, tasks)
 
-    agent = PPOAgent(env)
+    agent = PPOAgent(env, n_frames=N_FRAMES)
 
-    print(f"Training started with {GROUP_SIZE} parallel agents.")
+    print(
+        f"Training started with {GROUP_SIZE} parallel agents and {N_FRAMES} frames stacking."
+    )
     agent.train(curriculum, NUM_ROLLOUTS)
     print("Training completed.")
 
