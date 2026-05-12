@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -5,6 +7,7 @@ from torch.distributions import Normal, TransformedDistribution
 from torch.distributions.transforms import TanhTransform
 from torch.optim import Adam
 
+from curriculum import BoxBound, CurriculumManager
 from gym import PyEnvironment
 
 
@@ -109,94 +112,110 @@ class PPOAgent:
         return adv
 
     @torch.no_grad()
-    def collect_trajectories(self, horizon=8192):
-        obs = self.env.reset()
+    def collect_trajectories(self, horizon=2048):
+        group_size = self.env.group_size
+        obs = self.env.reset()  # Vec of observations
 
-        obs_buf = np.zeros((horizon, self.env.obs_dim), dtype=np.float32)
-        act_buf = np.zeros((horizon, self.env.act_dim), dtype=np.float32)
-        logp_buf = np.zeros((horizon,), dtype=np.float32)
-        rew_buf = np.zeros((horizon,), dtype=np.float32)
-        done_buf = np.zeros((horizon,), dtype=np.bool_)
-        trunc_buf = np.zeros((horizon,), dtype=np.bool_)
-        val_buf = np.zeros((horizon,), dtype=np.float32)
-        val_next_buf = np.zeros((horizon,), dtype=np.float32)
+        # Per-agent buffers
+        obs_bufs = [[] for _ in range(group_size)]
+        act_bufs = [[] for _ in range(group_size)]
+        logp_bufs = [[] for _ in range(group_size)]
+        rew_bufs = [[] for _ in range(group_size)]
+        done_bufs = [[] for _ in range(group_size)]
+        trunc_bufs = [[] for _ in range(group_size)]
+        val_bufs = [[] for _ in range(group_size)]
+        val_next_bufs = [[] for _ in range(group_size)]
 
-        for t in range(horizon):
-            obs_t = torch.as_tensor(
-                obs, dtype=torch.float32, device=self.device
-            ).unsqueeze(0)
-            dist = self.policy.get_dist(obs_t)
-            v = self.value(obs_t).item()
+        agent_dones = [False] * group_size
+        success_count = 0
 
-            action = dist.rsample()
-            logp = dist.log_prob(action).sum(dim=-1)
+        for _ in range(horizon):
+            if all(agent_dones):
+                break
 
-            action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
-            next_obs, reward, done, reason = self.env.step(action_np)
-            is_trunc = bool(done and (reason == "timeout"))
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+            dist = self.policy.get_dist(obs_tensor)
+            values = self.value(obs_tensor)
 
-            next_obs_t = torch.as_tensor(
+            actions = dist.rsample()
+            logps = dist.log_prob(actions).sum(dim=-1)
+
+            actions_np = actions.cpu().numpy().astype(np.float32)
+            next_obs, rewards, next_dones, reasons = self.env.step(actions_np.tolist())
+
+            next_obs_tensor = torch.as_tensor(
                 next_obs, dtype=torch.float32, device=self.device
-            ).unsqueeze(0)
-            v_next = self.value(next_obs_t).item()
+            )
+            next_values = self.value(next_obs_tensor)
 
-            obs_buf[t] = obs
-            act_buf[t] = action
-            logp_buf[t] = logp
-            rew_buf[t] = reward
-            done_buf[t] = done
-            trunc_buf[t] = is_trunc
-            val_buf[t] = v
-            val_next_buf[t] = v_next
+            for i in range(group_size):
+                if not agent_dones[i]:
+                    obs_bufs[i].append(obs[i])
+                    act_bufs[i].append(actions_np[i])
+                    logp_bufs[i].append(logps[i].item())
+                    rew_bufs[i].append(rewards[i])
+                    done_bufs[i].append(next_dones[i])
+                    is_trunc = next_dones[i] and reasons[i] == "timeout"
+                    trunc_bufs[i].append(is_trunc)
+                    val_bufs[i].append(values[i].item())
+                    val_next_bufs[i].append(next_values[i].item())
+
+                    if next_dones[i]:
+                        agent_dones[i] = True
+                        if reasons[i] == "success":
+                            success_count += 1
 
             obs = next_obs
-            if done:
-                obs = self.env.reset()
+
+        # Flatten all buffers
+        flat_obs, flat_act, flat_logp, flat_adv, flat_ret = [], [], [], [], []
+
+        for i in range(group_size):
+            if not obs_bufs[i]:
+                continue
+
+            # Compute GAE for this agent's trajectory
+            r = torch.tensor(rew_bufs[i], device=self.device)
+            v = torch.tensor(val_bufs[i], device=self.device)
+            vn = torch.tensor(val_next_bufs[i], device=self.device)
+            d = torch.tensor(done_bufs[i], device=self.device)
+            tr = torch.tensor(trunc_bufs[i], device=self.device)
+            mask = 1.0 - (d.float() * (~tr).float())
+
+            adv = self._compute_gae(r, v, vn, mask, d.float())
+            ret = adv + v
+
+            flat_obs.append(np.array(obs_bufs[i]))
+            flat_act.append(np.array(act_bufs[i]))
+            flat_logp.append(np.array(logp_bufs[i]))
+            flat_adv.append(adv.cpu().numpy())
+            flat_ret.append(ret.cpu().numpy())
 
         return (
-            obs_buf,
-            act_buf,
-            logp_buf,
-            rew_buf,
-            done_buf,
-            trunc_buf,
-            val_buf,
-            val_next_buf,
+            np.concatenate(flat_obs),
+            np.concatenate(flat_act),
+            np.concatenate(flat_logp),
+            np.concatenate(flat_adv),
+            np.concatenate(flat_ret),
+            success_count,
         )
 
-    def train(self, num_rollouts, horizon=8192):
-        time = 0
-        while time < num_rollouts:
-            obs_b, act_b, logp_old_b, rew_b, done_b, trunc_b, val_old_b, val_next_b = (
+    def train(self, curriculum, num_rollouts, horizon=2048):
+        for rollout in range(1, num_rollouts + 1):
+            obs_b, act_b, logp_old_b, adv_b, ret_b, success_count = (
                 self.collect_trajectories(horizon=horizon)
             )
-            time += 1
 
             obs_t = torch.as_tensor(obs_b, dtype=torch.float32, device=self.device)
             act_t = torch.as_tensor(act_b, dtype=torch.float32, device=self.device)
             logp_old_t = torch.as_tensor(
                 logp_old_b, dtype=torch.float32, device=self.device
             )
-            rew_t = torch.as_tensor(rew_b, dtype=torch.float32, device=self.device)
-            val_old_t = torch.as_tensor(
-                val_old_b, dtype=torch.float32, device=self.device
-            )
-            val_next_t = torch.as_tensor(
-                val_next_b, dtype=torch.float32, device=self.device
-            )
+            adv_t = torch.as_tensor(adv_b, dtype=torch.float32, device=self.device)
+            ret_t = torch.as_tensor(ret_b, dtype=torch.float32, device=self.device)
 
-            terminated_t = torch.as_tensor(
-                done_b & (~trunc_b), dtype=torch.float32, device=self.device
-            )
-            done_t = torch.as_tensor(done_b, dtype=torch.float32, device=self.device)
-            bootstrap_mask = 1.0 - terminated_t
-
-            adv_t = self._compute_gae(
-                rew_t, val_old_t, val_next_t, bootstrap_mask, done_t
-            )
-            ret_t = adv_t + val_old_t
-
-            adv_t = (adv_t - adv_t.mean()) / (adv_t.std(unbiased=False) + 1e-8)
+            # Standardize advantages
+            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
             n = obs_t.shape[0]
             avg_pi_loss, avg_v_loss, avg_entropy, avg_kl, num_batches = (
@@ -220,9 +239,7 @@ class PPOAgent:
 
                     dist = self.policy.get_dist(obs_mb)
                     logp = dist.log_prob(act_mb).sum(dim=-1)
-                    entropy = dist.base_dist.entropy().sum(
-                        dim=-1
-                    )  # use base normal dist as proxy
+                    entropy = dist.base_dist.entropy().sum(dim=-1)
 
                     ratio = torch.exp(logp - logp_old_mb)
                     surr1 = ratio * adv_mb
@@ -263,9 +280,7 @@ class PPOAgent:
                     ):
                         early_stop = True
                         break
-
                 if early_stop:
-                    print(f"Early stopping at epoch {epoch + 1}.")
                     break
 
             avg_pi_loss /= num_batches
@@ -273,29 +288,47 @@ class PPOAgent:
             avg_entropy /= num_batches
             avg_kl /= num_batches
 
+            # Update curriculum
+            curriculum.update_metrics(success_count, self.env.group_size)
+
             print(
-                f"Rollout: {time}, Policy Loss: {avg_pi_loss:.3f}, Value Loss: {avg_v_loss:.3f}, "
-                f"Avg Reward: {rew_t.mean(dim=-1):.3f}, Avg Entropy: {avg_entropy:.3f}, Avg KL Div: {avg_kl:.3f}"  # type: ignore
+                f"Rollout: {rollout:3d} | Pi Loss: {avg_pi_loss:6.3f} | V Loss: {avg_v_loss:6.3f} | "
+                f"Succ: {success_count:2d}/{self.env.group_size} | Lvl: {curriculum.task_idx} | "
+                f"Entropy: {avg_entropy:5.2f} | KL: {avg_kl:6.4f}"
             )
 
-            if time % 100 == 0:
+            if rollout % 50 == 0:
                 torch.save(self.policy.state_dict(), "./models/policy_net.pth")
                 torch.save(self.value.state_dict(), "./models/value_net.pth")
-                print("Checkpoint saved.")
 
 
 def main():
-    import os
-
     os.makedirs("./models", exist_ok=True)
 
-    MAX_STEPS = 8192
-    NUM_ROLLOUTS = 300
-    env = PyEnvironment(MAX_STEPS)
+    MAX_STEPS = 2000
+    GROUP_SIZE = 32
+    NUM_ROLLOUTS = 2000
+
+    env = PyEnvironment(MAX_STEPS, GROUP_SIZE)
+
+    tasks = [
+        # Level 0: Vertical drop, close to ground
+        BoxBound(40.0, 40.0, 5.0, 10.0, 0.0, 0.0),
+        # Level 1: Small angle variance
+        BoxBound(40.0, 40.0, 10.0, 20.0, -0.1, 0.1),
+        # Level 2: Small X variance
+        BoxBound(30.0, 50.0, 20.0, 30.0, -0.2, 0.2),
+        # Level 3: Larger angle variance
+        BoxBound(20.0, 60.0, 30.0, 40.0, -0.3, 0.3),
+        # Level 4: Full range
+        BoxBound(10.0, 70.0, 30.0, 40.0, -0.5, 0.5),
+    ]
+    curriculum = CurriculumManager(env, tasks)
+
     agent = PPOAgent(env)
 
-    print("Training started.")
-    agent.train(NUM_ROLLOUTS)
+    print(f"Training started with {GROUP_SIZE} parallel agents.")
+    agent.train(curriculum, NUM_ROLLOUTS)
     print("Training completed.")
 
 
