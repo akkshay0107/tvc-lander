@@ -7,6 +7,7 @@ use pyo3::types::PyDict;
 use rand::Rng;
 use rapier2d::na::Isometry2;
 use rapier2d::prelude::*;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EpisodeStatus {
@@ -32,49 +33,44 @@ impl EpisodeStatus {
 #[pyclass]
 pub struct PyEnvironment {
     world: World,
-    prev_potential: f32,
+    prev_potentials: Vec<f32>,
     steps: u32,
-    tot_steps: u32,
     max_steps: u32,
     obs_dim: u32,
     act_dim: u32,
+    group_size: usize,
+    spawn_x_range: (f32, f32),
+    spawn_y_range: (f32, f32),
+    spawn_angle_range: (f32, f32),
 }
 
 #[pymethods]
 impl PyEnvironment {
     #[new]
-    pub fn new(max_steps: u32) -> Self {
-        let world = World::new();
+    pub fn new(max_steps: u32, group_size: usize) -> Self {
+        let world = World::new(group_size);
         Self {
             world,
-            prev_potential: 0.0,
+            prev_potentials: vec![0.0; group_size],
             steps: 0,
-            tot_steps: 0,
             max_steps,
             obs_dim: 6,
             act_dim: 2,
+            group_size,
+            spawn_x_range: (MAX_POS_X / 2.0, MAX_POS_X / 2.0),
+            spawn_y_range: (5.0, 5.0),
+            spawn_angle_range: (0.0, 0.0),
         }
     }
 
-    // world doesn't need a getter
     #[getter]
     pub fn get_steps(&self) -> u32 {
         self.steps
     }
 
     #[getter]
-    pub fn get_tot_steps(&self) -> u32 {
-        self.tot_steps
-    }
-
-    #[getter]
     pub fn get_max_steps(&self) -> u32 {
         self.max_steps
-    }
-
-    #[getter]
-    pub fn get_prev_potential(&self) -> f32 {
-        self.prev_potential
     }
 
     #[getter]
@@ -87,17 +83,31 @@ impl PyEnvironment {
         self.act_dim
     }
 
-    #[setter]
-    pub fn set_tot_steps(&mut self, tot_steps: u32) {
-        self.tot_steps = tot_steps;
+    #[getter]
+    pub fn get_group_size(&self) -> usize {
+        self.group_size
     }
 
-    pub fn reset(&mut self) -> PyResult<[f32; 6]> {
-        self.world = World::new();
+    pub fn set_spawn_x_range(&mut self, min: f32, max: f32) {
+        self.spawn_x_range = (min, max);
+    }
+
+    pub fn set_spawn_y_range(&mut self, min: f32, max: f32) {
+        self.spawn_y_range = (min, max);
+    }
+
+    pub fn set_spawn_angle_range(&mut self, min: f32, max: f32) {
+        self.spawn_angle_range = (min, max);
+    }
+
+    pub fn reset(&mut self) -> PyResult<Vec<[f32; 6]>> {
+        self.world = World::new(self.group_size);
         self.steps = 0;
 
-        let init_state = self._sample(); // Random valid state
-        self.prev_potential = self.calculate_potential(
+        // All rockets start at the same sample for simplicity in parallel batching,
+        // but we can also sample independently if needed.
+        let init_state = self._sample();
+        let potential = self._calculate_potential(
             init_state[0],
             init_state[1],
             init_state[2],
@@ -105,41 +115,72 @@ impl PyEnvironment {
             init_state[4],
             init_state[5],
         );
+        self.prev_potentials = vec![potential; self.group_size];
 
-        // Set the state to the rocket in the world
-        let rocket = self
-            .world
-            .rigid_body_set
-            .get_mut(self.world.rocket_body_handle)
-            .unwrap();
-        rocket.set_position(
-            Isometry2::new(vector![init_state[0], init_state[1]], init_state[2]),
-            true,
-        );
-        rocket.set_linvel(vector![init_state[3], init_state[4]], true);
-        rocket.set_angvel(init_state[5], true);
+        for &handle in &self.world.rocket_handles {
+            let rocket = self.world.rigid_body_set.get_mut(handle).unwrap();
+            rocket.set_position(
+                Isometry2::new(vector![init_state[0], init_state[1]], init_state[2]),
+                true,
+            );
+            rocket.set_linvel(vector![init_state[3], init_state[4]], true);
+            rocket.set_angvel(init_state[5], true);
+        }
 
-        Ok(self._normalize(init_state))
+        let normalized = self._normalize(init_state);
+        Ok(vec![normalized; self.group_size])
     }
 
-    pub fn step(&mut self, action: [f32; 2]) -> PyResult<([f32; 6], f32, bool, &'static str)> {
-        // Run the physics step in rapier for the next state
-        let [thrust, gimbal_angle] = action;
-        self.world.apply_thruster_forces(thrust, gimbal_angle);
+    pub fn step(
+        &mut self,
+        actions: Vec<[f32; 2]>,
+    ) -> PyResult<(Vec<[f32; 6]>, Vec<f32>, Vec<bool>, Vec<&'static str>)> {
+        self.world.apply_multi_thruster_forces(&actions);
         self.world.step();
         self.steps += 1;
 
-        let (x, y, theta) = self.world.get_rocket_state();
-        let (vx, vy, omega) = self.world.get_rocket_dynamics();
-        let next_state = self._normalize([x, y, theta, vx, vy, omega]);
+        let states = self.world.get_multi_rocket_state();
+        let dynamics = self.world.get_multi_rocket_dynamics();
 
-        let (reason, done) = self._episode_status(x, y, theta, vx, vy, omega);
-        let reward = self.calculate_reward(x, y, theta, vx, vy, omega);
+        let results: Vec<([f32; 6], f32, f32, bool, &'static str)> = (0..self.group_size)
+            .into_par_iter()
+            .map(|i| {
+                let (x, y, theta) = states[i];
+                let (vx, vy, omega) = dynamics[i];
 
-        Ok((next_state, reward, done, reason))
+                let obs = self._normalize([x, y, theta, vx, vy, omega]);
+                let (reason, done) = self._episode_status(x, y, theta, vx, vy, omega);
+                let (reward, potential) = self._calculate_reward(i, x, y, theta, vx, vy, omega);
+
+                (obs, reward, potential, done, reason)
+            })
+            .collect();
+
+        let mut next_obs = Vec::with_capacity(self.group_size);
+        let mut rewards = Vec::with_capacity(self.group_size);
+        let mut dones = Vec::with_capacity(self.group_size);
+        let mut reasons = Vec::with_capacity(self.group_size);
+
+        for (i, (obs, reward, potential, done, reason)) in results.into_iter().enumerate() {
+            next_obs.push(obs);
+            rewards.push(reward);
+            dones.push(done);
+            reasons.push(reason);
+            self.prev_potentials[i] = potential;
+        }
+
+        Ok((next_obs, rewards, dones, reasons))
     }
 
-    fn calculate_potential(&self, x: f32, y: f32, theta: f32, vx: f32, vy: f32, omega: f32) -> f32 {
+    fn _calculate_potential(
+        &self,
+        x: f32,
+        y: f32,
+        theta: f32,
+        vx: f32,
+        vy: f32,
+        omega: f32,
+    ) -> f32 {
         let [nx, ny, ntheta, nvx, nvy, nomega] = self._normalize([x, y, theta, vx, vy, omega]);
 
         // center is (max_x/2, 0) => potential should be min there
@@ -159,18 +200,18 @@ impl PyEnvironment {
         100.0 * potential
     }
 
-    fn calculate_reward(
-        &mut self,
+    fn _calculate_reward(
+        &self,
+        idx: usize,
         x: f32,
         y: f32,
         theta: f32,
         vx: f32,
         vy: f32,
         omega: f32,
-    ) -> f32 {
-        let current_potential = self.calculate_potential(x, y, theta, vx, vy, omega);
-        let shaping_reward = current_potential - self.prev_potential;
-        self.prev_potential = current_potential;
+    ) -> (f32, f32) {
+        let current_potential = self._calculate_potential(x, y, theta, vx, vy, omega);
+        let shaping_reward = current_potential - self.prev_potentials[idx];
 
         let mut terminal_reward = 0.0;
         let base_success = 100.0;
@@ -179,11 +220,14 @@ impl PyEnvironment {
             terminal_reward = -base_success;
         } else if self._is_successful_landing(x, y, theta, vx, vy, omega) {
             let ndx = (2.0 * x - MAX_POS_X) / MAX_POS_X;
-            terminal_reward = base_success * (-2.0 * ndx.powi(2)).exp(); // gaussian reward
+            terminal_reward = base_success * (-2.0 * ndx.powi(2)).exp();
         }
 
         let time_penalty = 5e-3;
-        shaping_reward + terminal_reward - time_penalty
+        (
+            shaping_reward + terminal_reward - time_penalty,
+            current_potential,
+        )
     }
 
     fn _normalize(&self, obs: [f32; 6]) -> [f32; 6] {
@@ -200,33 +244,10 @@ impl PyEnvironment {
 
     fn _sample(&self) -> [f32; 6] {
         let mut rng = rand::rng();
-
-        let center_x = MAX_POS_X / 2.0;
-
-        let (spawn_width, box_bottom, box_top) = if self.tot_steps < 100_000 {
-            (0.0, 5.0, 5.0)
-        } else if self.tot_steps < 250_000 {
-            (5.0, 10.0, 20.0)
-        } else if self.tot_steps < 500_000 {
-            (10.0, 15.0, 30.0)
-        } else if self.tot_steps < 1_000_000 {
-            (20.0, 20.0, 35.0)
-        } else {
-            (35.0, 20.0, 42.0)
-        };
-
-        let box_left = center_x - spawn_width;
-        let box_right = center_x + spawn_width;
-
-        let start_x: f32 = rng.random_range(box_left..=box_right);
-        let start_y: f32 = rng.random_range(box_bottom..=box_top);
-        let start_angle: f32 = rng.random_range(-MAX_ANGLE_DEFLECTION..=MAX_ANGLE_DEFLECTION);
-
-        // From the implememtation in base/src/world.rs
-        // rotation is prevented when dragging, and velocities
-        // is forcefully set to 0 when the drag ends
-        // All starting sequences must have v & omega = 0
-
+        let start_x: f32 = rng.random_range(self.spawn_x_range.0..=self.spawn_x_range.1);
+        let start_y: f32 = rng.random_range(self.spawn_y_range.0..=self.spawn_y_range.1);
+        let start_angle: f32 =
+            rng.random_range(self.spawn_angle_range.0..=self.spawn_angle_range.1);
         [start_x, start_y, start_angle, 0.0, 0.0, 0.0]
     }
 
@@ -291,7 +312,8 @@ impl PyEnvironment {
     }
 
     pub fn render_info(&self, py: Python) -> PyResult<PyObject> {
-        let (rocket_x, rocket_y, rocket_angle) = self.world.get_rocket_state();
+        let states = self.world.get_multi_rocket_state();
+        let (rocket_x, rocket_y, rocket_angle) = states[0]; // Render the first one for simplicity
 
         let state_dict = PyDict::new_bound(py);
         state_dict.set_item("rocket_x", rocket_x)?;

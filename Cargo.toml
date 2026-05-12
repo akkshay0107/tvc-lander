@@ -5,3 +5,4 @@ resolver = "3"
 [workspace.dependencies]
 rapier2d = { version = "0.26.1", features = ["simd-stable"] }
 rand = "0.9.1"
+rayon = "1.10.0"

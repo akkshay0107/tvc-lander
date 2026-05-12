@@ -1,12 +1,10 @@
-//! A 2D physics simulation world controlling the rocket
+//! A 2D physics simulation world controlling multiple rockets
 //!
-//! This module contains the physics simulation world for the rocket landing scenario
-//! Contains the physical rocket body and the ground and has methods to which modify
-//! the velocity and position of the rocket rigid body and support drag and drop of the
-//! rocket body
+//! This module contains the physics simulation world for the rocket landing scenario.
+//! It supports multiple rockets ghosting through each other while colliding with the ground.
 
-use macroquad::prelude::*;
 use rapier2d::prelude::*;
+use rayon::prelude::*;
 
 use crate::constants::{MAX_GIMBAL_ANGLE, MAX_THRUST, ROCKET_HEIGHT_M, ROCKET_WIDTH_M};
 
@@ -17,7 +15,12 @@ const GROUND_SIZE: Vector<f32> = vector![40.0, 6.0];
 const ANGULAR_DRAG_COEFFICIENT: f32 = 2.5;
 const LINEAR_DRAG_COEFFICIENT: f32 = 1.75;
 
-const TOLERANCE_RADIUS: f32 = 1.5; // Set to the average of the dimensions of the rocket body
+// Collision Groups
+// Group 1: Ground
+// Group 2: Rockets
+// Rockets should collide with ground (Group 1) but not with each other.
+const GROUP_GROUND: InteractionGroups = InteractionGroups::new(Group::GROUP_1, Group::ALL);
+const GROUP_ROCKET: InteractionGroups = InteractionGroups::new(Group::GROUP_2, Group::GROUP_1);
 
 pub struct World {
     pub rigid_body_set: RigidBodySet,
@@ -32,27 +35,31 @@ pub struct World {
     pub gravity: Vector<f32>,
     pub integration_parameters: IntegrationParameters,
     pub physics_pipeline: PhysicsPipeline,
-    pub rocket_body_handle: RigidBodyHandle,
+    pub rocket_handles: Vec<RigidBodyHandle>,
+    pub group_size: usize,
     pub is_dragging: bool,
-    pub drag_start_pos: Option<Vector<f32>>,
-    pub drag_anchor: Option<Vector<f32>>,
+    pub drag_start_world: Vector<f32>,
+    pub drag_current_world: Vector<f32>,
 }
 
 impl World {
-    pub fn new() -> Self {
+    pub fn new(group_size: usize) -> Self {
         let mut rigid_body_set = RigidBodySet::new();
         let mut collider_set = ColliderSet::new();
 
         let ground_position = vector![40.0, -6.0];
-        let _ground_handle =
-            Self::create_ground(&mut rigid_body_set, &mut collider_set, ground_position);
+        Self::create_ground(&mut rigid_body_set, &mut collider_set, ground_position);
 
+        let mut rocket_handles = Vec::with_capacity(group_size);
         let rocket_start_position = vector![40.0, 40.0];
-        let rocket_body_handle = Self::create_rocket(
-            &mut rigid_body_set,
-            &mut collider_set,
-            rocket_start_position,
-        );
+        for _ in 0..group_size {
+            let handle = Self::create_rocket(
+                &mut rigid_body_set,
+                &mut collider_set,
+                rocket_start_position,
+            );
+            rocket_handles.push(handle);
+        }
 
         Self {
             rigid_body_set,
@@ -67,10 +74,11 @@ impl World {
             gravity: vector![0.0, -9.81],
             integration_parameters: IntegrationParameters::default(),
             physics_pipeline: PhysicsPipeline::new(),
-            rocket_body_handle,
+            rocket_handles,
+            group_size,
             is_dragging: false,
-            drag_start_pos: None,
-            drag_anchor: None,
+            drag_start_world: vector![0.0, 0.0],
+            drag_current_world: vector![0.0, 0.0],
         }
     }
 
@@ -84,6 +92,7 @@ impl World {
 
         let collider = ColliderBuilder::cuboid(GROUND_SIZE.x, GROUND_SIZE.y)
             .restitution(GROUND_RESTITUTION)
+            .collision_groups(GROUP_GROUND)
             .build();
         collider_set.insert_with_parent(collider, ground_handle, rigid_body_set);
 
@@ -108,6 +117,7 @@ impl World {
         let body_collider = ColliderBuilder::cuboid(half_width, half_height)
             .restitution(ROCKET_RESTITUTION)
             .mass(ROCKET_MASS)
+            .collision_groups(GROUP_ROCKET)
             .build();
         collider_set.insert_with_parent(body_collider, rocket_handle, rigid_body_set);
 
@@ -133,163 +143,133 @@ impl World {
     }
 
     pub fn apply_thruster_forces(&mut self, thrust: f32, gimbal_angle: f32) {
-        // Both thrust and gimbal angle assumed to be normalized
-        if thrust < -1.0 || thrust > 1.0 {
-            panic!(
-                "Thrust isn't in the normalized range. Normalize thrust to [-1, 1] before passing it."
-            )
-        }
+        self.apply_multi_thruster_forces(&[[thrust, gimbal_angle]]);
+    }
 
-        if gimbal_angle < -1.0 || gimbal_angle > 1.0 {
-            panic!(
-                "Gimbal angle isn't in the normalized range. Normalize thrust to [-1, 1] before passing it."
-            )
-        }
+    pub fn apply_multi_thruster_forces(&mut self, actions: &[[f32; 2]]) {
+        // Parallelize force calculation
+        let forces: Vec<(Vector<f32>, f32)> = self
+            .rocket_handles
+            .par_iter()
+            .enumerate()
+            .map(|(i, &handle)| {
+                let [thrust, gimbal_angle] = actions[i];
 
-        if thrust == 0.0 {
-            return;
-        }
+                let raw_thrust = (MAX_THRUST * (1.0 + thrust)) / 2.0;
+                let raw_thrust = raw_thrust.clamp(0.0, MAX_THRUST);
 
-        let raw_thrust = (MAX_THRUST * (1.0 + thrust)) / 2.0;
-        let raw_gimbal_angle = gimbal_angle * MAX_GIMBAL_ANGLE;
+                if raw_thrust <= 0.0001 {
+                    return (vector![0.0, 0.0], 0.0);
+                }
+                let raw_gimbal_angle = gimbal_angle * MAX_GIMBAL_ANGLE;
 
-        let rocket_body = self
-            .rigid_body_set
-            .get_mut(self.rocket_body_handle)
-            .unwrap();
-        let angle_from_vertical = raw_gimbal_angle + rocket_body.rotation().angle();
+                let rocket_body = &self.rigid_body_set[handle];
+                let angle_from_vertical = raw_gimbal_angle + rocket_body.rotation().angle();
 
-        // Find thrust in world coordinates
-        let thrust_force_world = vector![
-            raw_thrust * angle_from_vertical.sin(),
-            raw_thrust * angle_from_vertical.cos()
-        ];
+                let thrust_force_world = vector![
+                    raw_thrust * angle_from_vertical.sin(),
+                    raw_thrust * angle_from_vertical.cos()
+                ];
 
-        // equivalent to updating force
-        rocket_body.reset_forces(true);
-        rocket_body.add_force(thrust_force_world, true);
+                let y_offset = ROCKET_HEIGHT_M / 2.0;
+                let offset = (0.0, -y_offset);
+                let thrust_force_body = (
+                    raw_thrust * raw_gimbal_angle.sin(),
+                    raw_thrust * raw_gimbal_angle.cos(),
+                );
 
-        // Find torque on rocket body
-        let y_offset = ROCKET_HEIGHT_M / 2.0;
-        let offset = (0.0, -y_offset);
-        let thrust_force_body = (
-            raw_thrust * raw_gimbal_angle.sin(),
-            raw_thrust * raw_gimbal_angle.cos(),
-        );
+                let torque = offset.0 * thrust_force_body.1 - offset.1 * thrust_force_body.0;
+                (thrust_force_world, torque)
+            })
+            .collect();
 
-        let torque = Self::cross_product(offset, thrust_force_body);
-        rocket_body.reset_torques(true);
-        if torque != 0.0 {
-            rocket_body.add_torque(torque, true);
+        // Apply forces in serial (RigidBodySet is not thread-safe for mutation in this way)
+        for (i, (force, torque)) in forces.into_iter().enumerate() {
+            let rb = self.rigid_body_set.get_mut(self.rocket_handles[i]).unwrap();
+            rb.reset_forces(true);
+            rb.add_force(force, true);
+            rb.reset_torques(true);
+            if torque != 0.0 {
+                rb.add_torque(torque, true);
+            }
         }
     }
 
-    fn cross_product(a: (f32, f32), b: (f32, f32)) -> f32 {
-        // k component of a cross b where a and b lie in the xy plane
-        a.0 * b.1 - a.1 * b.0
+    pub fn get_multi_rocket_state(&self) -> Vec<(f32, f32, f32)> {
+        self.rocket_handles
+            .par_iter()
+            .map(|&h| {
+                let rb = &self.rigid_body_set[h];
+                (
+                    rb.translation().x,
+                    rb.translation().y,
+                    rb.rotation().angle(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn get_multi_rocket_dynamics(&self) -> Vec<(f32, f32, f32)> {
+        self.rocket_handles
+            .par_iter()
+            .map(|&h| {
+                let rb = &self.rigid_body_set[h];
+                let linvel = rb.linvel();
+                let angvel = rb.angvel();
+                (linvel.x, linvel.y, angvel)
+            })
+            .collect()
     }
 
     pub fn get_rocket_state(&self) -> (f32, f32, f32) {
-        let rocket_body = &self.rigid_body_set[self.rocket_body_handle];
-        (
-            rocket_body.translation().x,
-            rocket_body.translation().y,
-            rocket_body.rotation().angle(),
-        )
+        let (x, y, a) = self.get_multi_rocket_state()[0];
+        (x, y, a)
     }
 
     pub fn get_rocket_dynamics(&self) -> (f32, f32, f32) {
-        let rocket_body = &self.rigid_body_set[self.rocket_body_handle];
-        let lin_vel = rocket_body.linvel();
-        let ang_vel = rocket_body.angvel();
-        (lin_vel.x, lin_vel.y, ang_vel)
+        let (vx, vy, w) = self.get_multi_rocket_dynamics()[0];
+        (vx, vy, w)
     }
 
-    pub fn start_drag(&mut self, mouse_world_pos: Vector<f32>) -> bool {
-        let rocket_body = &self.rigid_body_set[self.rocket_body_handle];
-        let rocket_pos = rocket_body.translation();
-
-        let dx = mouse_world_pos.x - rocket_pos.x;
-        let dy = mouse_world_pos.y - rocket_pos.y;
-        let sq_dist = dx * dx + dy * dy;
-
-        // Only start drag if within tolerance limit
-        if sq_dist < TOLERANCE_RADIUS * TOLERANCE_RADIUS {
-            self.is_dragging = true;
-            self.drag_start_pos = Some(rocket_pos.clone());
-            self.drag_anchor = Some(vector![
-                mouse_world_pos.x - rocket_pos.x,
-                mouse_world_pos.y - rocket_pos.y
-            ]);
-            return true;
-        }
-
-        false
+    // Drag-and-drop logic for a single rocket (usually the first one)
+    pub fn start_drag(&mut self, pos: Vector<f32>) {
+        self.is_dragging = true;
+        self.drag_start_world = pos;
+        self.drag_current_world = pos;
     }
 
-    pub fn update_drag(&mut self, mouse_world_pos: Vector<f32>) {
-        if !self.is_dragging {
-            return;
-        }
-
-        if let Some(anchor) = &self.drag_anchor {
-            if let Some(rocket_body) = self.rigid_body_set.get_mut(self.rocket_body_handle) {
-                // Calculate target position based on mouse position and anchor point
-                let target_pos =
-                    vector![mouse_world_pos.x - anchor.x, mouse_world_pos.y - anchor.y];
-
-                let current_pos = rocket_body.translation();
-                let to_target = target_pos - current_pos;
-
-                // Give the rocket enough velocity to just lag behind the mouse
-                // 60 fps => speed / distance should be 60 for perfect following
-                // coefficient should be slightly lower for the lag effect
-                let factor = 20.0;
-                let velocity = to_target * factor;
-
-                rocket_body.set_linvel(velocity, true);
-                // Prevent rotation while dragging
-                rocket_body.set_angvel(0.0, true);
-                rocket_body.wake_up(true);
+    pub fn update_drag(&mut self, pos: Vector<f32>) {
+        if self.is_dragging {
+            self.drag_current_world = pos;
+            let drag_force = (self.drag_current_world - self.drag_start_world) * 100.0;
+            for &handle in &self.rocket_handles {
+                let rb = self.rigid_body_set.get_mut(handle).unwrap();
+                rb.apply_impulse(drag_force * 0.016, true);
             }
         }
     }
 
     pub fn end_drag(&mut self) {
         self.is_dragging = false;
-        self.drag_start_pos = None;
-        self.drag_anchor = None;
-
-        // Reset angular velocity when drag ends
-        if let Some(rocket_body) = self.rigid_body_set.get_mut(self.rocket_body_handle) {
-            rocket_body.set_angvel(0.0, true);
-            rocket_body.set_linvel(vector![0.0, 0.0], true);
-        }
     }
 }
 
 impl Default for World {
     fn default() -> Self {
-        Self::new()
+        Self::new(1)
     }
 }
 
 pub fn pixels_per_meter() -> f32 {
-    screen_width() / crate::constants::MAX_POS_X
+    20.0
 }
 
 pub fn world_to_pixel(x: f32, y: f32) -> (f32, f32) {
     let ppm = pixels_per_meter();
-    let ground_y = screen_height() * 0.8;
-    let screen_x = x * ppm;
-    let screen_y = ground_y - y * ppm;
-    (screen_x, screen_y)
+    (x * ppm, 800.0 - y * ppm)
 }
 
-pub fn pixel_to_world(screen_x: f32, screen_y: f32) -> (f32, f32) {
+pub fn pixel_to_world(x: f32, y: f32) -> (f32, f32) {
     let ppm = pixels_per_meter();
-    let ground_y = screen_height() * 0.8;
-    let world_x = screen_x / ppm;
-    let world_y = (ground_y - screen_y) / ppm;
-    (world_x, world_y)
+    (x / ppm, (800.0 - y) / ppm)
 }

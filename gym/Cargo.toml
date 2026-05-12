@@ -12,3 +12,4 @@ base = { path = "../base" }
 pyo3 = { version = "0.22.2", features = ["extension-module"] }
 rapier2d = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
