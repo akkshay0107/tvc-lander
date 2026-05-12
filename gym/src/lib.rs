@@ -104,31 +104,24 @@ impl PyEnvironment {
         self.world = World::new(self.group_size);
         self.steps = 0;
 
-        // All rockets start at the same sample for simplicity in parallel batching,
-        // but we can also sample independently if needed.
-        let init_state = self._sample();
-        let potential = self._calculate_potential(
-            init_state[0],
-            init_state[1],
-            init_state[2],
-            init_state[3],
-            init_state[4],
-            init_state[5],
-        );
-        self.prev_potentials = vec![potential; self.group_size];
+        let mut next_obs = Vec::with_capacity(self.group_size);
+        self.prev_potentials = Vec::with_capacity(self.group_size);
 
         for &handle in &self.world.rocket_handles {
+            let state = self._sample();
+            let potential = self
+                ._calculate_potential(state[0], state[1], state[2], state[3], state[4], state[5]);
+            self.prev_potentials.push(potential);
+
             let rocket = self.world.rigid_body_set.get_mut(handle).unwrap();
-            rocket.set_position(
-                Isometry2::new(vector![init_state[0], init_state[1]], init_state[2]),
-                true,
-            );
-            rocket.set_linvel(vector![init_state[3], init_state[4]], true);
-            rocket.set_angvel(init_state[5], true);
+            rocket.set_position(Isometry2::new(vector![state[0], state[1]], state[2]), true);
+            rocket.set_linvel(vector![state[3], state[4]], true);
+            rocket.set_angvel(state[5], true);
+
+            next_obs.push(self._normalize(state));
         }
 
-        let normalized = self._normalize(init_state);
-        Ok(vec![normalized; self.group_size])
+        Ok(next_obs)
     }
 
     pub fn step(
@@ -183,21 +176,17 @@ impl PyEnvironment {
     ) -> f32 {
         let [nx, ny, ntheta, nvx, nvy, nomega] = self._normalize([x, y, theta, vx, vy, omega]);
 
-        // center is (max_x/2, 0) => potential should be min there
-        let ndist = nx.powi(2) + ny.powi(2);
-        let dist_score = 1.0 - (ndist / 2.0);
+        let dist_sq = nx.powi(2) + ny.powi(2);
+        let vel_sq = nvx.powi(2) + nvy.powi(2);
+        let angle_sq = ntheta.powi(2) + nomega.powi(2);
 
-        // slow velocity preferred
-        let speed = (nvx.powi(2) + nvy.powi(2)).sqrt();
-        let speed_score = 1.0 - (speed / SQRT_2).min(1.0);
+        let dist_score = (1.0 - (dist_sq / 2.0)).max(0.0);
+        let vel_score = (1.0 - (vel_sq / 2.0)).max(0.0);
+        let angle_score = (1.0 - (angle_sq / 2.0)).max(0.0);
 
-        // reward being upright and not spinning too much
-        let angle_norm = (ntheta.powi(2) + nomega.powi(2).min(1.0)).sqrt(); // [0, sqrt2]
-        let angle_score = 1.0 - (angle_norm / SQRT_2);
+        let potential = 0.4 * dist_score + 0.3 * vel_score + 0.3 * angle_score;
 
-        let potential = 0.5 * dist_score + 0.2 * angle_score + 0.3 * speed_score;
-
-        100.0 * potential
+        50.0 * potential
     }
 
     fn _calculate_reward(
@@ -214,16 +203,19 @@ impl PyEnvironment {
         let shaping_reward = current_potential - self.prev_potentials[idx];
 
         let mut terminal_reward = 0.0;
-        let base_success = 100.0;
+        let base_terminal = 25.0;
 
         if self._is_crash_landing(x, y, theta, vx, vy, omega) || self._is_oob(x, y) {
-            terminal_reward = -base_success;
+            terminal_reward = -base_terminal;
         } else if self._is_successful_landing(x, y, theta, vx, vy, omega) {
-            let ndx = (2.0 * x - MAX_POS_X) / MAX_POS_X;
-            terminal_reward = base_success * (-2.0 * ndx.powi(2)).exp();
+            let [nx, _, _, _, _, _] = self._normalize([x, y, theta, vx, vy, omega]);
+            // Reward for landing, with a significant bonus for precision (nx -> 0)
+            terminal_reward = base_terminal + base_terminal * (-4.0 * nx.powi(2)).exp();
         }
 
-        let time_penalty = 5e-3;
+        // Constant time penalty to encourage efficiency and discourage 'potential-hunting'
+        let time_penalty = 0.01;
+
         (
             shaping_reward + terminal_reward - time_penalty,
             current_potential,

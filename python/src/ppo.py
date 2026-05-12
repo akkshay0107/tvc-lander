@@ -1,3 +1,4 @@
+import logging
 import os
 from collections import deque
 
@@ -22,7 +23,7 @@ class PPOAgent:
         lr=3e-4,
         epochs=10,
         batch_size=256,
-        ent_coef=5e-3,
+        ent_coef=0.01,
         target_kl=0.02,
         device="cpu",
     ):
@@ -202,7 +203,7 @@ class PPOAgent:
                 for start in range(0, n, self.batch_size):
                     b = idx[start : start + self.batch_size]
                     obs_mb = obs_t[b]
-                    act_mb = act_t[b]
+                    act_mb = torch.clamp(act_t[b], -0.99999, 0.99999)
                     logp_old_mb = logp_old_t[b]
                     adv_mb = adv_t[b]
                     ret_mb = ret_t[b]
@@ -260,11 +261,13 @@ class PPOAgent:
 
             curriculum.update_metrics(success_count, self.env.group_size)
 
-            print(
+            log_str = (
                 f"Rollout: {rollout:3d} | Pi Loss: {avg_pi_loss:6.3f} | V Loss: {avg_v_loss:6.3f} | "
                 f"Succ: {success_count:2d}/{self.env.group_size} | Lvl: {curriculum.task_idx} | "
                 f"Entropy: {avg_entropy:5.2f} | KL: {avg_kl:6.4f}"
             )
+            print(log_str)
+            logging.info(log_str)
 
             if rollout % 50 == 0:
                 torch.save(self.policy.state_dict(), "./models/policy_net.pth")
@@ -273,6 +276,12 @@ class PPOAgent:
 
 def main():
     os.makedirs("./models", exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler("training.log"), logging.StreamHandler()],
+    )
 
     MAX_STEPS = 2000
     GROUP_SIZE = 32
@@ -292,11 +301,11 @@ def main():
 
     agent = PPOAgent(env, n_frames=N_FRAMES)
 
-    print(
+    logging.info(
         f"Training started with {GROUP_SIZE} parallel agents and {N_FRAMES} frames stacking."
     )
     agent.train(curriculum, NUM_ROLLOUTS)
-    print("Training completed.")
+    logging.info("Training completed.")
 
 
 if __name__ == "__main__":
