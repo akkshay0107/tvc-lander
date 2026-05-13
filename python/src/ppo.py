@@ -20,10 +20,10 @@ class PPOAgent:
         gamma=0.995,
         lam=0.95,
         clip_eps=0.2,
-        lr=3e-4,
-        epochs=10,
+        lr=1e-4,
+        epochs=4,
         batch_size=256,
-        ent_coef=0.01,
+        ent_coef=5e-3,
         target_kl=0.02,
         device="cpu",
     ):
@@ -197,7 +197,7 @@ class PPOAgent:
                 0,
             )
 
-            for epoch in range(self.epochs):
+            for _ in range(self.epochs):
                 early_stop = False
                 idx = torch.randperm(n, device=self.device)
                 for start in range(0, n, self.batch_size):
@@ -266,7 +266,6 @@ class PPOAgent:
                 f"Succ: {success_count:2d}/{self.env.group_size} | Lvl: {curriculum.task_idx} | "
                 f"Entropy: {avg_entropy:5.2f} | KL: {avg_kl:6.4f}"
             )
-            print(log_str)
             logging.info(log_str)
 
             if rollout % 50 == 0:
@@ -283,7 +282,7 @@ def main():
         handlers=[logging.FileHandler("training.log"), logging.StreamHandler()],
     )
 
-    MAX_STEPS = 2000
+    MAX_STEPS = 8192
     GROUP_SIZE = 32
     NUM_ROLLOUTS = 2000
     N_FRAMES = 4
@@ -295,7 +294,7 @@ def main():
         BoxBound(40.0, 40.0, 10.0, 20.0, -0.1, 0.1),
         BoxBound(30.0, 50.0, 20.0, 30.0, -0.2, 0.2),
         BoxBound(20.0, 60.0, 30.0, 40.0, -0.3, 0.3),
-        BoxBound(10.0, 70.0, 30.0, 40.0, -0.5, 0.5),
+        BoxBound(5.0, 75.0, 30.0, 40.0, -0.5, 0.5),
     ]
     curriculum = CurriculumManager(env, tasks)
 

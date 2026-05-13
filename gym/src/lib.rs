@@ -1,4 +1,4 @@
-use std::f32::consts::{PI, SQRT_2};
+use std::f32::consts::PI;
 
 use base::constants::*;
 use base::world::World;
@@ -143,7 +143,8 @@ impl PyEnvironment {
 
                 let obs = self._normalize([x, y, theta, vx, vy, omega]);
                 let (reason, done) = self._episode_status(x, y, theta, vx, vy, omega);
-                let (reward, potential) = self._calculate_reward(i, x, y, theta, vx, vy, omega);
+                let (reward, potential) =
+                    self._calculate_reward(i, x, y, theta, vx, vy, omega, actions[i]);
 
                 (obs, reward, potential, done, reason)
             })
@@ -176,17 +177,19 @@ impl PyEnvironment {
     ) -> f32 {
         let [nx, ny, ntheta, nvx, nvy, nomega] = self._normalize([x, y, theta, vx, vy, omega]);
 
-        let dist_sq = nx.powi(2) + ny.powi(2);
+        // bias towards x
+        let dist_sq = 1.5 * nx.powi(2) + ny.powi(2);
         let vel_sq = nvx.powi(2) + nvy.powi(2);
         let angle_sq = ntheta.powi(2) + nomega.powi(2);
 
-        let dist_score = (1.0 - (dist_sq / 2.0)).max(0.0);
+        // normalize scores
+        let dist_score = (1.0 - (dist_sq / 2.5)).max(0.0);
         let vel_score = (1.0 - (vel_sq / 2.0)).max(0.0);
         let angle_score = (1.0 - (angle_sq / 2.0)).max(0.0);
 
-        let potential = 0.4 * dist_score + 0.3 * vel_score + 0.3 * angle_score;
+        let potential = 0.5 * dist_score + 0.2 * vel_score + 0.3 * angle_score;
 
-        50.0 * potential
+        5.0 * potential
     }
 
     fn _calculate_reward(
@@ -198,26 +201,32 @@ impl PyEnvironment {
         vx: f32,
         vy: f32,
         omega: f32,
+        action: [f32; 2],
     ) -> (f32, f32) {
         let current_potential = self._calculate_potential(x, y, theta, vx, vy, omega);
         let shaping_reward = current_potential - self.prev_potentials[idx];
 
         let mut terminal_reward = 0.0;
-        let base_terminal = 25.0;
+        let base_terminal = 5.0; // Balanced with potential scale
 
         if self._is_crash_landing(x, y, theta, vx, vy, omega) || self._is_oob(x, y) {
             terminal_reward = -base_terminal;
         } else if self._is_successful_landing(x, y, theta, vx, vy, omega) {
             let [nx, _, _, _, _, _] = self._normalize([x, y, theta, vx, vy, omega]);
-            // Reward for landing, with a significant bonus for precision (nx -> 0)
-            terminal_reward = base_terminal + base_terminal * (-4.0 * nx.powi(2)).exp();
+
+            let centering_bonus = base_terminal * (1.0 - nx.abs());
+            let precision_bonus = base_terminal * (-nx.powi(2)).exp();
+
+            terminal_reward = base_terminal + 0.5 * centering_bonus + 0.5 * precision_bonus;
         }
 
-        // Constant time penalty to encourage efficiency and discourage 'potential-hunting'
-        let time_penalty = 0.01;
+        // fuel and time penalty to prefer more efficient trajs
+        let time_penalty = 0.02;
+        let thrust_norm = (action[0] + 1.0) / 2.0;
+        let fuel_penalty = 5e-3 * thrust_norm;
 
         (
-            shaping_reward + terminal_reward - time_penalty,
+            shaping_reward + terminal_reward - time_penalty - fuel_penalty,
             current_potential,
         )
     }
