@@ -6,12 +6,12 @@
 use rapier2d::prelude::*;
 use rayon::prelude::*;
 
-use crate::constants::{MAX_GIMBAL_ANGLE, MAX_THRUST, ROCKET_HEIGHT_M, ROCKET_WIDTH_M};
+use crate::constants::{MAX_GIMBAL_ANGLE, MAX_POS_X, MAX_THRUST, ROCKET_HEIGHT_M, ROCKET_WIDTH_M};
 
 const GROUND_RESTITUTION: f32 = 0.5;
 const ROCKET_RESTITUTION: f32 = 0.1;
 const ROCKET_MASS: f32 = 1.0;
-const GROUND_SIZE: Vector<f32> = vector![40.0, 6.0];
+const GROUND_SIZE_Y: f32 = 6.0;
 const ANGULAR_DRAG_COEFFICIENT: f32 = 2.5;
 const LINEAR_DRAG_COEFFICIENT: f32 = 1.75;
 
@@ -47,11 +47,12 @@ impl World {
         let mut rigid_body_set = RigidBodySet::new();
         let mut collider_set = ColliderSet::new();
 
-        let ground_position = vector![40.0, -6.0];
+        // Physical ground is at y=0. Collider is centered at -GROUND_SIZE_Y.
+        let ground_position = vector![MAX_POS_X / 2.0, -GROUND_SIZE_Y];
         Self::create_ground(&mut rigid_body_set, &mut collider_set, ground_position);
 
         let mut rocket_handles = Vec::with_capacity(group_size);
-        let rocket_start_position = vector![40.0, 40.0];
+        let rocket_start_position = vector![MAX_POS_X / 2.0, 30.0];
         for _ in 0..group_size {
             let handle = Self::create_rocket(
                 &mut rigid_body_set,
@@ -90,7 +91,7 @@ impl World {
         let ground = RigidBodyBuilder::fixed().translation(position).build();
         let ground_handle = rigid_body_set.insert(ground);
 
-        let collider = ColliderBuilder::cuboid(GROUND_SIZE.x, GROUND_SIZE.y)
+        let collider = ColliderBuilder::cuboid(MAX_POS_X / 2.0, GROUND_SIZE_Y)
             .restitution(GROUND_RESTITUTION)
             .collision_groups(GROUP_GROUND)
             .build();
@@ -231,26 +232,54 @@ impl World {
         (vx, vy, w)
     }
 
-    // Drag-and-drop logic for a single rocket (usually the first one)
+    // Drag-and-drop logic for a single rocket (only meant for the graphical sims)
     pub fn start_drag(&mut self, pos: Vector<f32>) {
-        self.is_dragging = true;
-        self.drag_start_world = pos;
-        self.drag_current_world = pos;
+        let rb = &self.rigid_body_set[self.rocket_handles[0]];
+        let rocket_pos = rb.translation();
+        let dist = (rocket_pos - pos).norm();
+
+        // Only start drag if close to the rocket (within 5 meters)
+        if dist < 5.0 {
+            self.is_dragging = true;
+            self.drag_start_world = pos;
+            self.drag_current_world = pos;
+        }
     }
 
     pub fn update_drag(&mut self, pos: Vector<f32>) {
         if self.is_dragging {
             self.drag_current_world = pos;
-            let drag_force = (self.drag_current_world - self.drag_start_world) * 100.0;
             for &handle in &self.rocket_handles {
                 let rb = self.rigid_body_set.get_mut(handle).unwrap();
-                rb.apply_impulse(drag_force * 0.016, true);
+                let rocket_pos = *rb.translation();
+                let rocket_vel = *rb.linvel();
+
+                // spring force: pull towards mouse
+                let spring_k = 150.0;
+                let damping_c = 15.0;
+
+                let force = (pos - rocket_pos) * spring_k - rocket_vel * damping_c;
+                rb.apply_impulse(force * 0.016, true);
+
+                // torque to pull upright
+                let angle = rb.rotation().angle();
+                let torque_k = 10.0;
+                let torque_d = 2.0;
+                let torque = -angle * torque_k - rb.angvel() * torque_d;
+                rb.apply_torque_impulse(torque * 0.016, true);
             }
         }
     }
 
     pub fn end_drag(&mut self) {
-        self.is_dragging = false;
+        if self.is_dragging {
+            for &handle in &self.rocket_handles {
+                let rb = self.rigid_body_set.get_mut(handle).unwrap();
+                rb.set_linvel(vector![0.0, 0.0], true);
+                rb.set_angvel(0.0, true);
+            }
+            self.is_dragging = false;
+        }
     }
 }
 
@@ -261,15 +290,19 @@ impl Default for World {
 }
 
 pub fn pixels_per_meter() -> f32 {
-    20.0
+    macroquad::window::screen_width() / crate::constants::MAX_POS_X
+}
+
+pub fn ground_y_px() -> f32 {
+    crate::constants::MAX_POS_Y * pixels_per_meter()
 }
 
 pub fn world_to_pixel(x: f32, y: f32) -> (f32, f32) {
     let ppm = pixels_per_meter();
-    (x * ppm, 800.0 - y * ppm)
+    (x * ppm, ground_y_px() - y * ppm)
 }
 
 pub fn pixel_to_world(x: f32, y: f32) -> (f32, f32) {
     let ppm = pixels_per_meter();
-    (x / ppm, (800.0 - y) / ppm)
+    (x / ppm, (ground_y_px() - y) / ppm)
 }

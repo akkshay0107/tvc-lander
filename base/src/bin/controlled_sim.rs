@@ -9,9 +9,18 @@ use rapier2d::prelude::*;
 
 use std::f32::consts::PI;
 
-#[macroquad::main("Controlled Sim")]
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "TVC Lander - Controlled".to_owned(),
+        window_width: 1600,
+        window_height: 900,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
 async fn main() {
-    let mut world = World::new();
+    let mut world = World::new(1);
     let mut game = Game::new();
     let mut policy_net: PolicyNet;
 
@@ -22,14 +31,13 @@ async fn main() {
     let start_x: f32 = rand::gen_range(20.0, MAX_POS_X - 20.0);
     let start_angle: f32 = rand::gen_range(-MAX_ANGLE_DEFLECTION, MAX_ANGLE_DEFLECTION);
 
-    let rocket = world
-        .rigid_body_set
-        .get_mut(world.rocket_body_handle)
-        .unwrap();
-    rocket.set_position(Isometry2::new(vector![start_x, 40.0], start_angle), true);
+    let rocket_handle = world.rocket_handles[0];
+    let rocket = world.rigid_body_set.get_mut(rocket_handle).unwrap();
+    rocket.set_position(Isometry2::new(vector![start_x, 35.0], start_angle), true);
 
     let obs_dim = 6;
-    let input_shape = vec![1, obs_dim];
+    let n_frames = 4;
+    let mut frame_buffer = std::collections::VecDeque::with_capacity(n_frames);
 
     #[cfg(feature = "logging")]
     let mut step_count = 0;
@@ -56,30 +64,38 @@ async fn main() {
 
         let obs = _normalize([rocket_x, rocket_y, rocket_angle, vel_x, vel_y, ang_vel]);
 
+        // frame stacking
+        if frame_buffer.is_empty() {
+            for _ in 0..n_frames {
+                frame_buffer.push_back(obs.clone());
+            }
+        } else {
+            frame_buffer.push_back(obs.clone());
+            if frame_buffer.len() > n_frames {
+                frame_buffer.pop_front();
+            }
+        }
+
+        let stacked_obs: Vec<f32> = frame_buffer.iter().flatten().cloned().collect();
+        let input_shape = vec![1, obs_dim * n_frames];
+
         #[cfg(feature = "logging")]
         {
-            use std::f32::consts::SQRT_2;
-
             println!("Observation state: {:?}", obs.clone());
 
-            // from gym
-            let [nx, ny, ntheta, nvx, nvy, nomega] = obs[..] else {
-                panic!("Failed unpacking normalized observation");
-            };
-
             // center is (max_x/2, 0) => potential should be min there
-            let ndist = (nx.powi(2) + ny.powi(2)).sqrt(); // [0, sqrt2]
-            let dist_score = 1.0 - (ndist / SQRT_2);
+            let [nx, ny, ntheta, nvx, nvy, nomega] =
+                [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5]];
 
-            // slow velocity preferred
-            let speed = (nvx.powi(2) + nvy.powi(2)).sqrt();
-            let speed_score = 1.0 - (speed / SQRT_2).min(1.0);
+            let dist_sq = nx.powi(2) + ny.powi(2);
+            let vel_sq = nvx.powi(2) + nvy.powi(2);
+            let angle_sq = ntheta.powi(2) + nomega.powi(2);
 
-            // reward being upright and not spinning too much
-            let angle_norm = (ntheta.powi(2) + nomega.powi(2).min(1.0)).sqrt(); // [0, sqrt2]
-            let angle_score = 1.0 - (angle_norm / SQRT_2);
+            let dist_score = (1.0 - (dist_sq / 2.0)).max(0.0);
+            let vel_score = (1.0 - (vel_sq / 2.0)).max(0.0);
+            let angle_score = (1.0 - (angle_sq / 2.0)).max(0.0);
 
-            let potential = 100.0 * (0.5 * dist_score + 0.15 * speed_score + 0.35 * angle_score);
+            let potential = 50.0 * (0.4 * dist_score + 0.3 * vel_score + 0.3 * angle_score);
             println!("Potential : {:?}", potential);
 
             step_count += 1;
@@ -89,9 +105,7 @@ async fn main() {
         let (thrust, gimbal_angle) = if world.is_dragging || rocket_y <= _MIN_POS_Y {
             (0.0, 0.0)
         } else {
-            let action = policy_net
-                .get_action(obs.clone(), input_shape.clone())
-                .unwrap();
+            let action = policy_net.get_action(stacked_obs, input_shape).unwrap();
             (action[0], action[1])
         };
 

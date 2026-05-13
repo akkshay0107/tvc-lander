@@ -10,7 +10,7 @@ use crate::{
 use macroquad::prelude::*;
 
 fn rocket_width() -> f32 {
-    ROCKET_WIDTH_M * pixels_per_meter() * 0.5
+    ROCKET_WIDTH_M * pixels_per_meter()
 }
 
 fn rocket_height() -> f32 {
