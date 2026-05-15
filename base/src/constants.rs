@@ -16,3 +16,5 @@ pub const MAX_THRUST: f32 = 20.0; // Thruster can offset gravity
 
 pub const ROCKET_WIDTH_M: f32 = 2.0;
 pub const ROCKET_HEIGHT_M: f32 = 4.0;
+
+pub const FLAG_DELTA: f32 = 10.0;

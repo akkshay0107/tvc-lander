@@ -9,10 +9,13 @@ use rapier2d::na::Isometry2;
 use rapier2d::prelude::*;
 use rayon::prelude::*;
 
+const BASE_REWARD_SCALE: f32 = 10.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EpisodeStatus {
     InProgress,
     Success,
+    MissingTarget,
     Crash,
     OutOfBounds,
     Timeout,
@@ -23,6 +26,7 @@ impl EpisodeStatus {
         match self {
             EpisodeStatus::InProgress => "in_progress",
             EpisodeStatus::Success => "success",
+            EpisodeStatus::MissingTarget => "missing_target",
             EpisodeStatus::Crash => "crash",
             EpisodeStatus::OutOfBounds => "out_of_bounds",
             EpisodeStatus::Timeout => "timeout",
@@ -178,18 +182,18 @@ impl PyEnvironment {
         let [nx, ny, ntheta, nvx, nvy, nomega] = self._normalize([x, y, theta, vx, vy, omega]);
 
         // bias towards x
-        let dist_sq = 1.5 * nx.powi(2) + ny.powi(2);
+        let dist_sq = 3.0 * nx.powi(2) + ny.powi(2);
         let vel_sq = nvx.powi(2) + nvy.powi(2);
         let angle_sq = ntheta.powi(2) + nomega.powi(2);
 
         // normalize scores
-        let dist_score = (1.0 - (dist_sq / 2.5)).max(0.0);
+        let dist_score = (1.0 - (dist_sq / 4.0)).max(0.0);
         let vel_score = (1.0 - (vel_sq / 2.0)).max(0.0);
         let angle_score = (1.0 - (angle_sq / 2.0)).max(0.0);
 
         let potential = 0.5 * dist_score + 0.2 * vel_score + 0.3 * angle_score;
 
-        5.0 * potential
+        BASE_REWARD_SCALE * potential
     }
 
     fn _calculate_reward(
@@ -206,19 +210,22 @@ impl PyEnvironment {
         let current_potential = self._calculate_potential(x, y, theta, vx, vy, omega);
         let shaping_reward = current_potential - self.prev_potentials[idx];
 
-        let mut terminal_reward = 0.0;
-        let base_terminal = 5.0; // Balanced with potential scale
+        let landed = y <= _MIN_POS_Y;
+        let terminal_reward = if self._is_oob(x, y) {
+            -BASE_REWARD_SCALE
+        } else if !landed {
+            0.0
+        } else {
+            if self._is_crash(theta, vx, vy, omega) {
+                -BASE_REWARD_SCALE
+            } else {
+                let nx = (2.0 * x - MAX_POS_X) / MAX_POS_X;
+                let centering_bonus = BASE_REWARD_SCALE * (1.0 - nx.abs());
+                let precision_bonus = BASE_REWARD_SCALE * (-nx.powi(2)).exp();
 
-        if self._is_crash_landing(x, y, theta, vx, vy, omega) || self._is_oob(x, y) {
-            terminal_reward = -base_terminal;
-        } else if self._is_successful_landing(x, y, theta, vx, vy, omega) {
-            let [nx, _, _, _, _, _] = self._normalize([x, y, theta, vx, vy, omega]);
-
-            let centering_bonus = base_terminal * (1.0 - nx.abs());
-            let precision_bonus = base_terminal * (-nx.powi(2)).exp();
-
-            terminal_reward = base_terminal + 0.5 * centering_bonus + 0.5 * precision_bonus;
-        }
+                BASE_REWARD_SCALE + 0.5 * centering_bonus + 0.5 * precision_bonus
+            }
+        };
 
         // fuel and time penalty to prefer more efficient trajs
         let time_penalty = 0.02;
@@ -256,33 +263,13 @@ impl PyEnvironment {
         Ok(self._sample())
     }
 
-    fn _is_crash_landing(&self, _x: f32, y: f32, theta: f32, vx: f32, vy: f32, omega: f32) -> bool {
-        let landed = y <= _MIN_POS_Y;
+    fn _is_crash(&self, theta: f32, vx: f32, vy: f32, omega: f32) -> bool {
         let bad_angle = theta.abs() > MAX_LANDING_ANGLE;
         let fast_land = vy.abs() > MAX_LANDING_VY;
         let fast_horiz = vx.abs() > MAX_LANDING_VX;
         let fast_spin = omega.abs() > MAX_LANDING_ANGULAR_VELOCITY;
 
-        landed && (bad_angle || fast_land || fast_horiz || fast_spin)
-    }
-
-    fn _is_successful_landing(
-        &self,
-        x: f32,
-        y: f32,
-        theta: f32,
-        vx: f32,
-        vy: f32,
-        omega: f32,
-    ) -> bool {
-        let landed = y <= _MIN_POS_Y;
-        let in_x_range = x > 0.0 && x < MAX_POS_X;
-        let gentle_angle = theta.abs() <= MAX_LANDING_ANGLE;
-        let gentle_vy = vy.abs() <= MAX_LANDING_VY;
-        let gentle_vx = vx.abs() <= MAX_LANDING_VX;
-        let gentle_omega = omega.abs() <= MAX_LANDING_ANGULAR_VELOCITY;
-
-        landed && in_x_range && gentle_angle && gentle_vy && gentle_vx && gentle_omega
+        bad_angle || fast_land || fast_horiz || fast_spin
     }
 
     fn _is_oob(&self, x: f32, y: f32) -> bool {
@@ -298,17 +285,26 @@ impl PyEnvironment {
         vy: f32,
         omega: f32,
     ) -> (&'static str, bool) {
-        let status = if self._is_successful_landing(x, y, theta, vx, vy, omega) {
-            EpisodeStatus::Success
-        } else if self._is_crash_landing(x, y, theta, vx, vy, omega) {
-            EpisodeStatus::Crash
-        } else if self._is_oob(x, y) {
+        let landed = y <= _MIN_POS_Y;
+
+        let status = if self._is_oob(x, y) {
             EpisodeStatus::OutOfBounds
         } else if self.steps >= self.max_steps {
             EpisodeStatus::Timeout
-        } else {
+        } else if !landed {
             EpisodeStatus::InProgress
+        } else {
+            let left_flag = (MAX_POS_X / 2.0) - FLAG_DELTA;
+            let right_flag = (MAX_POS_X / 2.0) + FLAG_DELTA;
+            if self._is_crash(theta, vx, vy, omega) {
+                EpisodeStatus::Crash
+            } else if left_flag <= x && x <= right_flag {
+                EpisodeStatus::Success
+            } else {
+                EpisodeStatus::MissingTarget
+            }
         };
+
         (status.as_str(), status != EpisodeStatus::InProgress)
     }
 

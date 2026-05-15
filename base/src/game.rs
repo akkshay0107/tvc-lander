@@ -1,3 +1,4 @@
+use crate::constants::FLAG_DELTA;
 use crate::world::{ground_y_px, pixels_per_meter};
 use macroquad::prelude::*;
 
@@ -196,6 +197,6 @@ impl Game {
         }
 
         self.draw_ground();
-        self.draw_landing_flags(10.0);
+        self.draw_landing_flags(FLAG_DELTA);
     }
 }
