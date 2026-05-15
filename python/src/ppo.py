@@ -172,7 +172,10 @@ class PPOAgent:
             success_count,
         )
 
-    def train(self, curriculum, num_rollouts, horizon=2048):
+    def train(
+        self, curriculum: CurriculumManager, num_rollouts: int, horizon: int = 2048
+    ) -> None:
+        prev_task_idx = 0
         for rollout in range(1, num_rollouts + 1):
             obs_b, act_b, logp_old_b, adv_b, ret_b, success_count = (
                 self.collect_trajectories(horizon=horizon)
@@ -260,6 +263,17 @@ class PPOAgent:
             avg_kl /= num_batches
 
             curriculum.update_metrics(success_count, self.env.group_size)
+            # save checkpoint on new level being reached
+            if prev_task_idx < curriculum.task_idx:
+                new_lvl = curriculum.task_idx
+                torch.save(
+                    self.policy.state_dict(), f"./models/policy_net_lvl_{new_lvl}.pth"
+                )
+                torch.save(
+                    self.value.state_dict(), f"./models/value_net_lvl_{new_lvl}.pth"
+                )
+
+            prev_task_idx = curriculum.task_idx
 
             log_str = (
                 f"Rollout: {rollout:3d} | Pi Loss: {avg_pi_loss:6.3f} | V Loss: {avg_v_loss:6.3f} | "
@@ -303,7 +317,7 @@ def main():
     logging.info(
         f"Training started with {GROUP_SIZE} parallel agents and {N_FRAMES} frames stacking."
     )
-    agent.train(curriculum, NUM_ROLLOUTS)
+    agent.train(curriculum, NUM_ROLLOUTS, horizon=MAX_STEPS)
     logging.info("Training completed.")
 
 
