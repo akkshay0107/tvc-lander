@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.distributions import Normal, TransformedDistribution
-from torch.distributions.transforms import TanhTransform
+from torch.distributions import Normal
 
 
 def _init_layer(linear: nn.Linear, gain: float):
@@ -48,7 +47,7 @@ class PolicyNet(nn.Module):
 
     def get_dist(self, obs):
         mean, std = self.forward(obs)
-        return TransformedDistribution(Normal(mean, std), [TanhTransform(cache_size=1)])
+        return Normal(mean, std)
 
 
 class ValueNet(nn.Module):

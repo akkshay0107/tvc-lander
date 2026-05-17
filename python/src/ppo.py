@@ -23,7 +23,7 @@ class PPOAgent:
         lr=1e-4,
         epochs=4,
         batch_size=256,
-        ent_coef=5e-3,
+        ent_coef=0.01,
         target_kl=0.02,
         device="cpu",
     ):
@@ -105,8 +105,12 @@ class PPOAgent:
             dist = self.policy.get_dist(obs_tensor)
             values = self.value(obs_tensor)
 
-            actions = dist.rsample()
-            logps = dist.log_prob(actions).sum(dim=-1)
+            raw_actions = dist.rsample()
+            actions = torch.tanh(raw_actions.clamp(min=-8.0, max=8.0))
+
+            eps = 1e-6
+            jac_term = torch.log(1.0 - actions.pow(2) + eps)
+            logps = (dist.log_prob(raw_actions) - jac_term).sum(dim=-1)
 
             actions_np = actions.cpu().numpy().astype(np.float32)
             next_obs, rewards, next_dones, reasons = self.env.step(actions_np.tolist())
@@ -122,7 +126,7 @@ class PPOAgent:
             for i in range(group_size):
                 if not agent_dones[i]:
                     obs_bufs[i].append(stacked_obs[i])
-                    act_bufs[i].append(actions_np[i])
+                    act_bufs[i].append(raw_actions[i].cpu().numpy())
                     logp_bufs[i].append(logps[i].item())
                     rew_bufs[i].append(rewards[i])
                     done_bufs[i].append(next_dones[i])
@@ -170,6 +174,7 @@ class PPOAgent:
             np.concatenate(flat_adv),
             np.concatenate(flat_ret),
             success_count,
+            np.mean([len(b) for b in obs_bufs if b]),
         )
 
     def train(
@@ -177,7 +182,7 @@ class PPOAgent:
     ) -> None:
         prev_task_idx = 0
         for rollout in range(1, num_rollouts + 1):
-            obs_b, act_b, logp_old_b, adv_b, ret_b, success_count = (
+            obs_b, act_b, logp_old_b, adv_b, ret_b, success_count, avg_ep_len = (
                 self.collect_trajectories(horizon=horizon)
             )
 
@@ -206,14 +211,18 @@ class PPOAgent:
                 for start in range(0, n, self.batch_size):
                     b = idx[start : start + self.batch_size]
                     obs_mb = obs_t[b]
-                    act_mb = torch.clamp(act_t[b], -0.99999, 0.99999)
+                    raw_act_mb = act_t[b]
                     logp_old_mb = logp_old_t[b]
                     adv_mb = adv_t[b]
                     ret_mb = ret_t[b]
 
                     dist = self.policy.get_dist(obs_mb)
-                    logp = dist.log_prob(act_mb).sum(dim=-1)
-                    entropy = dist.base_dist.entropy().sum(dim=-1)
+                    act_mb = torch.tanh(raw_act_mb)
+
+                    eps = 1e-6
+                    jac_term = torch.log(1.0 - act_mb.pow(2) + eps)
+                    logp = (dist.log_prob(raw_act_mb) - jac_term).sum(dim=-1)
+                    entropy = dist.entropy().sum(dim=-1)
 
                     ratio = torch.exp(logp - logp_old_mb)
                     surr1 = ratio * adv_mb
@@ -272,13 +281,17 @@ class PPOAgent:
                 torch.save(
                     self.value.state_dict(), f"./models/value_net_lvl_{new_lvl}.pth"
                 )
+                if self.policy.log_std.sum(dim=-1) < -1:
+                    # preserve learned mean and readd entropy on new stage
+                    with torch.no_grad():
+                        self.policy.log_std.fill_(-0.5)
 
             prev_task_idx = curriculum.task_idx
 
             log_str = (
                 f"Rollout: {rollout:3d} | Pi Loss: {avg_pi_loss:6.3f} | V Loss: {avg_v_loss:6.3f} | "
                 f"Succ: {success_count:2d}/{self.env.group_size} | Lvl: {curriculum.task_idx} | "
-                f"Entropy: {avg_entropy:5.2f} | KL: {avg_kl:6.4f}"
+                f"Entropy: {avg_entropy:5.2f} | KL: {avg_kl:6.4f} | Len: {avg_ep_len:4.0f}"
             )
             logging.info(log_str)
 
@@ -296,7 +309,7 @@ def main():
         handlers=[logging.FileHandler("training.log"), logging.StreamHandler()],
     )
 
-    MAX_STEPS = 8192
+    MAX_STEPS = 4096
     GROUP_SIZE = 32
     NUM_ROLLOUTS = 2000
     N_FRAMES = 4
@@ -317,7 +330,7 @@ def main():
     logging.info(
         f"Training started with {GROUP_SIZE} parallel agents and {N_FRAMES} frames stacking."
     )
-    agent.train(curriculum, NUM_ROLLOUTS, horizon=MAX_STEPS)
+    agent.train(curriculum, NUM_ROLLOUTS)
     logging.info("Training completed.")
 
 
