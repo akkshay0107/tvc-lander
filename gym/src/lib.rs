@@ -147,8 +147,7 @@ impl PyEnvironment {
 
                 let obs = self._normalize([x, y, theta, vx, vy, omega]);
                 let (reason, done) = self._episode_status(x, y, theta, vx, vy, omega);
-                let (reward, potential) =
-                    self._calculate_reward(i, x, y, theta, vx, vy, omega, actions[i]);
+                let (reward, potential) = self._calculate_reward(i, x, y, theta, vx, vy, omega);
 
                 (obs, reward, potential, done, reason)
             })
@@ -205,7 +204,6 @@ impl PyEnvironment {
         vx: f32,
         vy: f32,
         omega: f32,
-        action: [f32; 2],
     ) -> (f32, f32) {
         let current_potential = self._calculate_potential(x, y, theta, vx, vy, omega);
         let shaping_reward = current_potential - self.prev_potentials[idx];
@@ -215,25 +213,28 @@ impl PyEnvironment {
             -BASE_REWARD_SCALE
         } else if !landed {
             0.0
+        } else if self._is_crash(theta, vx, vy, omega) {
+            -BASE_REWARD_SCALE
         } else {
-            if self._is_crash(theta, vx, vy, omega) {
-                -BASE_REWARD_SCALE
-            } else {
-                let nx = (2.0 * x - MAX_POS_X) / MAX_POS_X;
-                let centering_bonus = BASE_REWARD_SCALE * (1.0 - nx.abs());
-                let precision_bonus = BASE_REWARD_SCALE * (-nx.powi(2)).exp();
+            let nx = (2.0 * x - MAX_POS_X) / MAX_POS_X;
+            let centering_bonus = BASE_REWARD_SCALE * (1.0 - nx.abs());
+            let precision_bonus = BASE_REWARD_SCALE * (-nx.powi(2)).exp();
 
-                BASE_REWARD_SCALE + 0.5 * centering_bonus + 0.5 * precision_bonus
+            let left_flag = (MAX_POS_X / 2.0) - FLAG_DELTA;
+            let right_flag = (MAX_POS_X / 2.0) + FLAG_DELTA;
+            let tot = BASE_REWARD_SCALE + 0.5 * centering_bonus + 0.5 * precision_bonus;
+
+            if x < left_flag || x > right_flag {
+                0.5 * tot
+            } else {
+                tot
             }
         };
 
-        // fuel and time penalty to prefer more efficient trajs
         let time_penalty = 0.02;
-        let thrust_norm = (action[0] + 1.0) / 2.0;
-        let fuel_penalty = 5e-3 * thrust_norm;
 
         (
-            shaping_reward + terminal_reward - time_penalty - fuel_penalty,
+            shaping_reward + terminal_reward - time_penalty,
             current_potential,
         )
     }
