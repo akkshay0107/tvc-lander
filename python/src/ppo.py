@@ -23,7 +23,7 @@ class PPOAgent:
         lr=3e-4,
         epochs=4,
         batch_size=512,
-        ent_coef=5e-3,
+        ent_coef=0.01,
         target_kl=0.02,
         device="cpu",
     ):
@@ -78,7 +78,7 @@ class PPOAgent:
         group_size = self.env.group_size
         obs = self.env.reset()  # Vec of observations
 
-        # Sample gSDE noise weights for this rollout
+        # Sample noise weights for this rollout
         self.policy.sample_noise(group_size)
 
         # Initialize frame buffers for stacking
@@ -108,7 +108,7 @@ class PPOAgent:
             dist = self.policy.get_dist(obs_tensor)
             values = self.value(obs_tensor)
 
-            raw_actions, _ = self.policy(obs_tensor)
+            raw_actions = self.policy(obs_tensor)
             actions = torch.tanh(raw_actions.clamp(min=-8.0, max=8.0))
 
             eps = 1e-6
@@ -286,10 +286,13 @@ class PPOAgent:
                 torch.save(
                     self.value.state_dict(), f"./models/value_net_lvl_{new_lvl}.pth"
                 )
-                if self.policy.log_std.sum(dim=-1) < -1:
+
+                if (
+                    self.policy.log_std.sum(dim=-1) < -2.0
+                ):  # equivalent to entropy falling under 0.8
                     # preserve learned mean and readd entropy on new stage
                     with torch.no_grad():
-                        self.policy.log_std.fill_(-0.5)
+                        self.policy.log_std.fill_(-1.0)
 
             prev_task_idx = curriculum.task_idx
 
