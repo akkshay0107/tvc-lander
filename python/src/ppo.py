@@ -20,10 +20,10 @@ class PPOAgent:
         gamma=0.995,
         lam=0.95,
         clip_eps=0.2,
-        lr=1e-4,
+        lr=3e-4,
         epochs=4,
-        batch_size=256,
-        ent_coef=0.01,
+        batch_size=512,
+        ent_coef=5e-3,
         target_kl=0.02,
         device="cpu",
     ):
@@ -78,6 +78,9 @@ class PPOAgent:
         group_size = self.env.group_size
         obs = self.env.reset()  # Vec of observations
 
+        # Sample gSDE noise weights for this rollout
+        self.policy.sample_noise(group_size)
+
         # Initialize frame buffers for stacking
         frame_buffers = [deque(maxlen=self.n_frames) for _ in range(group_size)]
         stacked_obs = self._get_stacked_obs(obs, frame_buffers)
@@ -105,7 +108,7 @@ class PPOAgent:
             dist = self.policy.get_dist(obs_tensor)
             values = self.value(obs_tensor)
 
-            raw_actions = dist.rsample()
+            raw_actions, _ = self.policy(obs_tensor)
             actions = torch.tanh(raw_actions.clamp(min=-8.0, max=8.0))
 
             eps = 1e-6
@@ -249,7 +252,9 @@ class PPOAgent:
                     self.optim.step()
 
                     with torch.no_grad():
-                        kl = (logp_old_mb - logp).mean()
+                        # stable approx of kl
+                        logr = logp - logp_old_mb
+                        kl = ((logr.exp() - 1) - logr).mean()
 
                     avg_pi_loss += pi_loss.item()
                     avg_v_loss += value_loss.item()
@@ -311,7 +316,7 @@ def main():
 
     MAX_STEPS = 4096
     GROUP_SIZE = 32
-    NUM_ROLLOUTS = 2000
+    NUM_ROLLOUTS = 20_000
     N_FRAMES = 4
 
     env = PyEnvironment(MAX_STEPS, GROUP_SIZE)
