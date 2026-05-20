@@ -4,5 +4,10 @@ __pycache__
 /dist
 *.log
 *.pth
+*.cpy
 !.github
 !.gitignore
+
+# baseline controller
+*.npz
+*control.py

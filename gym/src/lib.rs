@@ -231,7 +231,7 @@ impl PyEnvironment {
             }
         };
 
-        let time_penalty = 2e-3;
+        let time_penalty = 1e-3;
 
         (
             shaping_reward + terminal_reward - time_penalty,

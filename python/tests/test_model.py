@@ -13,8 +13,7 @@ from policy import PolicyNet
 
 
 def run_performance_test(model_path, num_episodes=1000, group_size=32, n_frames=4):
-    max_steps = 8192
-    env = PyEnvironment(max_steps, group_size)
+    env = PyEnvironment(max_steps=4096, group_size=group_size)
 
     # BoxBound(5.0, 75.0, 30.0, 40.0, -0.3, 0.3)
     env.set_spawn_x_range(5.0, 75.0)
@@ -22,7 +21,7 @@ def run_performance_test(model_path, num_episodes=1000, group_size=32, n_frames=
     env.set_spawn_angle_range(-0.3, 0.3)
 
     print(f"Loading model from {model_path}...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
+    device = "cpu"
     policy = PolicyNet(env.obs_dim, env.act_dim, n_frames=n_frames).to(device)
     policy.load_state_dict(torch.load(model_path, map_location=device), strict=False)
     policy.eval()
@@ -59,7 +58,7 @@ def run_performance_test(model_path, num_episodes=1000, group_size=32, n_frames=
                 current_obs, dtype=torch.float32, device=device
             )
             with torch.no_grad():
-                mean, _ = policy(obs_tensor, deterministic=True)
+                mean = policy(obs_tensor, deterministic=True)
                 actions = torch.tanh(mean)
 
             actions_np = actions.cpu().numpy()

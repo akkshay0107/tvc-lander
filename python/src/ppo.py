@@ -20,7 +20,7 @@ class PPOAgent:
         gamma=0.995,
         lam=0.95,
         clip_eps=0.2,
-        lr=3e-4,
+        lr=5e-6,
         epochs=10,
         batch_size=1024,
         ent_coef=0.01,
@@ -398,6 +398,18 @@ def main():
     ]
     curriculum = CurriculumManager(env, tasks)
     agent = PPOAgent(env, n_frames=4)
+
+    # load old checkpoint if exists
+    model_path = "./models/policy_net.pth"
+    if os.path.exists(model_path):
+        logging.info(f"Loading model from {model_path}")
+        agent.policy.load_state_dict(torch.load(model_path, map_location=agent.device))
+        # force reset entropy (to around -1.2)
+        # for the case when entropy collapses / explodes
+        # but still want to reuse model (delete old file otherwise)
+        agent.ent_coef = 1e-4
+        with torch.no_grad():
+            agent.policy.log_std.fill_(-2.0)
 
     logging.info(
         f"Training started! ({env.group_size} parallel envs, {agent.n_frames} frames stacked)"
