@@ -79,7 +79,6 @@ class PPOAgent:
         obs = self.env.reset()
 
         # per rollout setup
-        self.policy.sample_noise(group_size)
         frame_buffers = [deque(maxlen=self.n_frames) for _ in range(group_size)]
         stacked_obs = self._get_stacked_obs(obs, frame_buffers)
 
@@ -102,9 +101,14 @@ class PPOAgent:
             "missing_target": 0,
         }
 
-        for _ in range(horizon):
+        for t in range(horizon):
             if all(agent_dones):
                 break
+
+            # noise sampled every 2s assuming 60 Hz
+            # middle ground between rollout level bias and jitter
+            if t % 120 == 0:
+                self.policy.sample_noise(group_size)
 
             obs_tensor = torch.as_tensor(
                 stacked_obs, dtype=torch.float32, device=self.device
@@ -286,7 +290,7 @@ class PPOAgent:
                 logging.info(f"Validation: Rollout {rollout}, SR: {val_sr:.2%}")
 
                 prev_idx = curriculum.task_idx
-                if val_sr > 0.9:
+                if val_sr >= 0.85:
                     if curriculum.step_up():
                         logging.info(f"[Curriculum] UP to Lvl {curriculum.task_idx}")
                 elif val_sr < 0.20:

@@ -83,19 +83,19 @@ async fn main() {
         {
             println!("Observation state: {:?}", obs.clone());
 
-            // center is (max_x/2, 0) => potential should be min there
             let [nx, ny, ntheta, nvx, nvy, nomega] =
                 [obs[0], obs[1], obs[2], obs[3], obs[4], obs[5]];
 
-            let dist_sq = nx.powi(2) + ny.powi(2);
+            // center is (max_x/2, 0) => potential should be min there
+            let dist_sq = 3.0 * nx.powi(2) + ny.powi(2);
             let vel_sq = nvx.powi(2) + nvy.powi(2);
             let angle_sq = ntheta.powi(2) + nomega.powi(2);
 
-            let dist_score = (1.0 - (dist_sq / 2.0)).max(0.0);
+            let dist_score = (1.0 - (dist_sq / 4.0)).max(0.0);
             let vel_score = (1.0 - (vel_sq / 2.0)).max(0.0);
             let angle_score = (1.0 - (angle_sq / 2.0)).max(0.0);
 
-            let potential = 50.0 * (0.4 * dist_score + 0.3 * vel_score + 0.3 * angle_score);
+            let potential = 10.0 * (0.5 * dist_score + 0.2 * vel_score + 0.3 * angle_score);
             println!("Potential : {:?}", potential);
 
             step_count += 1;
@@ -103,7 +103,7 @@ async fn main() {
         }
 
         let (thrust, gimbal_angle) = if world.is_dragging || rocket_y <= _MIN_POS_Y {
-            (0.0, 0.0)
+            (-1.0, 0.0)
         } else {
             let action = policy_net.get_action(stacked_obs, input_shape).unwrap();
             (action[0], action[1])

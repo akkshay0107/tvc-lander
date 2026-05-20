@@ -18,7 +18,7 @@ class PolicyWrapper(nn.Module):
         if obs.dim() == 3:
             obs = obs.view(obs.size(0), -1)
 
-        latent = self.policy.feature_extractor(obs)
+        latent = self.policy.actor_net(obs)
         mean = self.policy.mean_layer(latent)
         return mean
 
