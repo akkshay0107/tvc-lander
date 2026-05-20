@@ -21,10 +21,10 @@ class PPOAgent:
         lam=0.95,
         clip_eps=0.2,
         lr=3e-4,
-        epochs=4,
-        batch_size=512,
+        epochs=10,
+        batch_size=1024,
         ent_coef=0.01,
-        target_kl=0.02,
+        target_kl=0.015,
         device="cpu",
     ):
         self.env = env
@@ -73,19 +73,17 @@ class PPOAgent:
             stacked.append(np.concatenate(list(buffer)))
         return np.array(stacked, dtype=np.float32)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def collect_trajectories(self, horizon=2048):
         group_size = self.env.group_size
-        obs = self.env.reset()  # Vec of observations
+        obs = self.env.reset()
 
-        # Sample noise weights for this rollout
+        # per rollout setup
         self.policy.sample_noise(group_size)
-
-        # Initialize frame buffers for stacking
         frame_buffers = [deque(maxlen=self.n_frames) for _ in range(group_size)]
         stacked_obs = self._get_stacked_obs(obs, frame_buffers)
 
-        # Per-agent buffers
+        # per agent buffers
         obs_bufs = [[] for _ in range(group_size)]
         act_bufs = [[] for _ in range(group_size)]
         logp_bufs = [[] for _ in range(group_size)]
@@ -96,7 +94,13 @@ class PPOAgent:
         val_next_bufs = [[] for _ in range(group_size)]
 
         agent_dones = [False] * group_size
-        success_count = 0
+        stats = {
+            "success": 0,
+            "crash": 0,
+            "out_of_bounds": 0,
+            "timeout": 0,
+            "missing_target": 0,
+        }
 
         for _ in range(horizon):
             if all(agent_dones):
@@ -109,7 +113,7 @@ class PPOAgent:
             values = self.value(obs_tensor)
 
             raw_actions = self.policy(obs_tensor)
-            actions = torch.tanh(raw_actions.clamp(min=-8.0, max=8.0))
+            actions = torch.tanh(raw_actions)
 
             eps = 1e-6
             jac_term = torch.log(1.0 - actions.pow(2) + eps)
@@ -118,9 +122,7 @@ class PPOAgent:
             actions_np = actions.cpu().numpy().astype(np.float32)
             next_obs, rewards, next_dones, reasons = self.env.step(actions_np.tolist())
 
-            # Prepare next stacked observation
             next_stacked_obs = self._get_stacked_obs(next_obs, frame_buffers)
-
             next_obs_tensor = torch.as_tensor(
                 next_stacked_obs, dtype=torch.float32, device=self.device
             )
@@ -140,16 +142,12 @@ class PPOAgent:
 
                     if next_dones[i]:
                         agent_dones[i] = True
-                        if reasons[i] == "success":
-                            success_count += 1
-                        # Reset frame buffer for this agent if it were to continue,
-                        # but here we just stop collecting for it.
+                        if reasons[i] in stats:
+                            stats[reasons[i]] += 1
 
             stacked_obs = next_stacked_obs
 
-        # Flatten all buffers
         flat_obs, flat_act, flat_logp, flat_adv, flat_ret = [], [], [], [], []
-
         for i in range(group_size):
             if not obs_bufs[i]:
                 continue
@@ -176,16 +174,29 @@ class PPOAgent:
             np.concatenate(flat_logp),
             np.concatenate(flat_adv),
             np.concatenate(flat_ret),
-            success_count,
+            stats,
             np.mean([len(b) for b in obs_bufs if b]),
         )
 
     def train(
         self, curriculum: CurriculumManager, num_rollouts: int, horizon: int = 2048
     ) -> None:
-        prev_task_idx = 0
+        agg_stats = {
+            "pi_loss": [],
+            "v_loss": [],
+            "entropy": [],
+            "kl": [],
+            "ep_len": [],
+            "success": 0,
+            "crash": 0,
+            "out_of_bounds": 0,
+            "timeout": 0,
+            "missing_target": 0,
+            "total_episodes": 0,
+        }
+
         for rollout in range(1, num_rollouts + 1):
-            obs_b, act_b, logp_old_b, adv_b, ret_b, success_count, avg_ep_len = (
+            obs_b, act_b, logp_old_b, adv_b, ret_b, stats, avg_ep_len = (
                 self.collect_trajectories(horizon=horizon)
             )
 
@@ -200,24 +211,15 @@ class PPOAgent:
             adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
             n = obs_t.shape[0]
-            avg_pi_loss, avg_v_loss, avg_entropy, avg_kl, num_batches = (
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0,
-            )
+            r_pi_loss, r_v_loss, r_ent, r_kl, r_batches = 0.0, 0.0, 0.0, 0.0, 0
 
             for _ in range(self.epochs):
                 early_stop = False
                 idx = torch.randperm(n, device=self.device)
                 for start in range(0, n, self.batch_size):
                     b = idx[start : start + self.batch_size]
-                    obs_mb = obs_t[b]
-                    raw_act_mb = act_t[b]
-                    logp_old_mb = logp_old_t[b]
-                    adv_mb = adv_t[b]
-                    ret_mb = ret_t[b]
+                    obs_mb, raw_act_mb = obs_t[b], act_t[b]
+                    logp_old_mb, adv_mb, ret_mb = logp_old_t[b], adv_t[b], ret_t[b]
 
                     dist = self.policy.get_dist(obs_mb)
                     act_mb = torch.tanh(raw_act_mb)
@@ -242,7 +244,6 @@ class PPOAgent:
                     value_loss = nn.MSELoss()(value, ret_mb)
 
                     loss = pi_loss + 0.5 * value_loss
-
                     self.optim.zero_grad(set_to_none=True)
                     loss.backward()
                     nn.utils.clip_grad_norm_(
@@ -256,56 +257,118 @@ class PPOAgent:
                         logr = logp - logp_old_mb
                         kl = ((logr.exp() - 1) - logr).mean()
 
-                    avg_pi_loss += pi_loss.item()
-                    avg_v_loss += value_loss.item()
-                    avg_entropy += entropy.mean().item()
-                    avg_kl += kl.item()
-                    num_batches += 1
+                    r_pi_loss += pi_loss.item()
+                    r_v_loss += value_loss.item()
+                    r_ent += entropy.mean().item()
+                    r_kl += kl.item()
+                    r_batches += 1
 
                     if (
                         self.target_kl is not None
-                        and (avg_kl / num_batches) > self.target_kl
+                        and (r_kl / r_batches) > self.target_kl
                     ):
                         early_stop = True
                         break
                 if early_stop:
                     break
 
-            avg_pi_loss /= num_batches
-            avg_v_loss /= num_batches
-            avg_entropy /= num_batches
-            avg_kl /= num_batches
+            agg_stats["pi_loss"].append(r_pi_loss / r_batches)
+            agg_stats["v_loss"].append(r_v_loss / r_batches)
+            agg_stats["entropy"].append(r_ent / r_batches)
+            agg_stats["kl"].append(r_kl / r_batches)
+            agg_stats["ep_len"].append(avg_ep_len)
+            agg_stats["total_episodes"] += self.env.group_size
+            for k in ["success", "crash", "out_of_bounds", "timeout", "missing_target"]:
+                agg_stats[k] += stats[k]
 
-            curriculum.update_metrics(success_count, self.env.group_size)
-            # save checkpoint on new level being reached
-            if prev_task_idx < curriculum.task_idx:
-                new_lvl = curriculum.task_idx
-                torch.save(
-                    self.policy.state_dict(), f"./models/policy_net_lvl_{new_lvl}.pth"
+            if rollout % 100 == 0:
+                val_sr = self.validate(num_rollouts=4, horizon=horizon)
+                logging.info(f"Validation: Rollout {rollout}, SR: {val_sr:.2%}")
+
+                prev_idx = curriculum.task_idx
+                if val_sr > 0.9:
+                    if curriculum.step_up():
+                        logging.info(f"[Curriculum] UP to Lvl {curriculum.task_idx}")
+                elif val_sr < 0.20:
+                    if curriculum.step_down():
+                        logging.info(f"[Curriculum] DOWN to Lvl {curriculum.task_idx}")
+
+                if prev_idx != curriculum.task_idx:
+                    torch.save(
+                        self.policy.state_dict(),
+                        f"./models/policy_lvl_{curriculum.task_idx}.pth",
+                    )
+                    if self.policy.log_std.sum() < -2.0:
+                        with torch.no_grad():
+                            self.policy.log_std.fill_(-1.0)
+
+            if rollout % 10 == 0:
+                avg_pi = np.mean(agg_stats["pi_loss"])
+                avg_v = np.mean(agg_stats["v_loss"])
+                avg_ent = np.mean(agg_stats["entropy"])
+                avg_kl = np.mean(agg_stats["kl"])
+                avg_len = np.mean(agg_stats["ep_len"])
+                total = agg_stats["total_episodes"]
+                freq = {
+                    k: (agg_stats[k] / total) * 100
+                    for k in [
+                        "success",
+                        "crash",
+                        "out_of_bounds",
+                        "timeout",
+                        "missing_target",
+                    ]
+                }
+                log_msg = (
+                    f"Rollout {rollout:5d} [Lvl {curriculum.task_idx}] | "
+                    f"Success: {freq['success']:5.1f}% | Crash: {freq['crash']:4.1f}% | "
+                    f"OOB: {freq['out_of_bounds']:4.1f}% | Time: {freq['timeout']:4.1f}% | "
+                    f"Miss: {freq['missing_target']:4.1f}%\n"
+                    f"      Losses: Pi {avg_pi:8.4f}, V {avg_v:8.4f}, Ent {avg_ent:5.2f}, KL {avg_kl:8.5f} | "
+                    f"AvgLen: {avg_len:4.0f}"
                 )
-                torch.save(
-                    self.value.state_dict(), f"./models/value_net_lvl_{new_lvl}.pth"
-                )
-
-                if (
-                    self.policy.log_std.sum(dim=-1) < -2.0
-                ):  # equivalent to entropy falling under 0.8
-                    # preserve learned mean and readd entropy on new stage
-                    with torch.no_grad():
-                        self.policy.log_std.fill_(-1.0)
-
-            prev_task_idx = curriculum.task_idx
-
-            log_str = (
-                f"Rollout: {rollout:3d} | Pi Loss: {avg_pi_loss:6.3f} | V Loss: {avg_v_loss:6.3f} | "
-                f"Succ: {success_count:2d}/{self.env.group_size} | Lvl: {curriculum.task_idx} | "
-                f"Entropy: {avg_entropy:5.2f} | KL: {avg_kl:6.4f} | Len: {avg_ep_len:4.0f}"
-            )
-            logging.info(log_str)
+                logging.info(log_msg)
+                for k in ["pi_loss", "v_loss", "entropy", "kl", "ep_len"]:
+                    agg_stats[k] = []
+                for k in [
+                    "success",
+                    "crash",
+                    "out_of_bounds",
+                    "timeout",
+                    "missing_target",
+                    "total_episodes",
+                ]:
+                    agg_stats[k] = 0
 
             if rollout % 50 == 0:
                 torch.save(self.policy.state_dict(), "./models/policy_net.pth")
                 torch.save(self.value.state_dict(), "./models/value_net.pth")
+
+    @torch.inference_mode()
+    def validate(self, num_rollouts=4, horizon=2048):
+        group_size = self.env.group_size
+        total_success, total_ep = 0, 0
+        for _ in range(num_rollouts):
+            obs = self.env.reset()
+            frame_bufs = [deque(maxlen=self.n_frames) for _ in range(group_size)]
+            stacked_obs = self._get_stacked_obs(obs, frame_bufs)
+            dones = [False] * group_size
+            for _ in range(horizon):
+                if all(dones):
+                    break
+                obs_t = torch.as_tensor(stacked_obs, device=self.device)
+                acts = torch.tanh(self.policy(obs_t, deterministic=True))
+                next_obs, _, next_dones, reasons = self.env.step(
+                    acts.cpu().numpy().tolist()
+                )
+                stacked_obs = self._get_stacked_obs(next_obs, frame_bufs)
+                for i in range(group_size):
+                    if not dones[i] and next_dones[i]:
+                        dones[i] = True
+                        total_ep += 1
+                        if reasons[i] == "success":
+                            total_success += 1
+        return total_success / total_ep if total_ep > 0 else 0.0
 
 
 def main():
@@ -314,16 +377,12 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler("training.log"), logging.StreamHandler()],
+        handlers=[
+            logging.FileHandler("training.log", mode="w"),
+        ],
     )
 
-    MAX_STEPS = 4096
-    GROUP_SIZE = 32
-    NUM_ROLLOUTS = 20_000
-    N_FRAMES = 4
-
-    env = PyEnvironment(MAX_STEPS, GROUP_SIZE)
-
+    env = PyEnvironment(max_steps=4096, group_size=64)
     tasks = [
         BoxBound(40.0, 40.0, 5.0, 10.0, 0.0, 0.0),
         BoxBound(40.0, 40.0, 10.0, 20.0, -0.1, 0.1),
@@ -334,14 +393,12 @@ def main():
         BoxBound(5.0, 75.0, 30.0, 40.0, -0.3, 0.3),
     ]
     curriculum = CurriculumManager(env, tasks)
-
-    agent = PPOAgent(env, n_frames=N_FRAMES)
+    agent = PPOAgent(env, n_frames=4)
 
     logging.info(
-        f"Training started with {GROUP_SIZE} parallel agents and {N_FRAMES} frames stacking."
+        f"Training started! ({env.group_size} parallel envs, {agent.n_frames} frames stacked)"
     )
-    agent.train(curriculum, NUM_ROLLOUTS)
-    logging.info("Training completed.")
+    agent.train(curriculum, num_rollouts=20_000)
 
 
 if __name__ == "__main__":

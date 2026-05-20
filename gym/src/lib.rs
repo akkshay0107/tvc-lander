@@ -225,13 +225,13 @@ impl PyEnvironment {
             let tot = BASE_REWARD_SCALE + 0.5 * centering_bonus + 0.5 * precision_bonus;
 
             if x < left_flag || x > right_flag {
-                0.5 * tot
+                0.3 * tot
             } else {
                 tot
             }
         };
 
-        let time_penalty = 0.02;
+        let time_penalty = 0.01;
 
         (
             shaping_reward + terminal_reward - time_penalty,
