@@ -292,30 +292,6 @@ class PPOAgent:
             for k in ["success", "crash", "out_of_bounds", "timeout", "missing_target"]:
                 agg_stats[k] += stats[k]
 
-            # checkpointing + val loop
-            if rollout % 100 == 0:
-                val_sr = self.validate(num_rollouts=4, horizon=horizon)
-                logging.info(f"Validation: Rollout {rollout}, SR: {val_sr:.2%}")
-
-                prev_idx = curriculum.task_idx
-                if val_sr >= 0.85:
-                    if curriculum.step_up():
-                        logging.info(f"[Curriculum] UP to Lvl {curriculum.task_idx}")
-                elif val_sr < 0.20:
-                    if curriculum.step_down():
-                        logging.info(f"[Curriculum] DOWN to Lvl {curriculum.task_idx}")
-
-                # auto save
-                torch.save(self.policy.state_dict(), "./models/policy_net.pth")
-                torch.save(self.value.state_dict(), "./models/value_net.pth")
-
-                # level up save
-                if prev_idx < curriculum.task_idx:
-                    torch.save(
-                        self.policy.state_dict(),
-                        f"./models/policy_lvl_{prev_idx}.pth",
-                    )
-
             # aggregate stats from last 10 rollouts
             if rollout % 10 == 0:
                 avg_pi = np.mean(agg_stats["pi_loss"])
@@ -354,6 +330,30 @@ class PPOAgent:
                     "total_episodes",
                 ]:
                     agg_stats[k] = 0
+
+            # checkpointing + val loop
+            if rollout % 100 == 0:
+                val_sr = self.validate(num_rollouts=4, horizon=horizon)
+                logging.info(f"Validation: Rollout {rollout}, SR: {val_sr:.2%}")
+
+                prev_idx = curriculum.task_idx
+                if val_sr >= 0.85:
+                    if curriculum.step_up():
+                        logging.info(f"[Curriculum] UP to Lvl {curriculum.task_idx}")
+                elif val_sr < 0.20:
+                    if curriculum.step_down():
+                        logging.info(f"[Curriculum] DOWN to Lvl {curriculum.task_idx}")
+
+                # auto save
+                torch.save(self.policy.state_dict(), "./models/policy_net.pth")
+                torch.save(self.value.state_dict(), "./models/value_net.pth")
+
+                # level up save
+                if prev_idx < curriculum.task_idx:
+                    torch.save(
+                        self.policy.state_dict(),
+                        f"./models/policy_lvl_{prev_idx}.pth",
+                    )
 
     @torch.inference_mode()
     def validate(self, num_rollouts=4, horizon=2048):
@@ -395,13 +395,13 @@ def main():
 
     env = PyEnvironment(max_steps=4096, group_size=64)
     tasks = [
-        BoxBound(40.0, 40.0, 5.0, 10.0, 0.0, 0.0),
-        BoxBound(40.0, 40.0, 10.0, 20.0, -0.1, 0.1),
-        BoxBound(30.0, 50.0, 20.0, 30.0, -0.3, 0.3),
-        BoxBound(20.0, 60.0, 30.0, 40.0, -0.1, 0.1),
-        BoxBound(5.0, 75.0, 30.0, 40.0, -0.1, 0.1),
-        BoxBound(20.0, 60.0, 30.0, 40.0, -0.3, 0.3),
-        BoxBound(5.0, 75.0, 30.0, 40.0, -0.3, 0.3),
+        BoxBound(40.0, 40.0, 5.0, 10.0, 0.0, 0.0),  # right above flag
+        BoxBound(40.0, 40.0, 10.0, 20.0, -0.1, 0.1),  # angle deviation above flag
+        BoxBound(30.0, 50.0, 20.0, 30.0, -0.3, 0.3),  # angle deviation in landing zone
+        BoxBound(20.0, 60.0, 30.0, 40.0, -0.1, 0.1),  # off center starts
+        BoxBound(5.0, 75.0, 30.0, 40.0, -0.1, 0.1),  # full horizontal range
+        BoxBound(20.0, 60.0, 30.0, 40.0, -0.3, 0.3),  # full angle range off center
+        BoxBound(5.0, 75.0, 30.0, 40.0, -0.3, 0.3),  # full horizontal + angle range
     ]
     curriculum = CurriculumManager(env, tasks)
     agent = PPOAgent(env, n_frames=4)
