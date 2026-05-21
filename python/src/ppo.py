@@ -183,8 +183,15 @@ class PPOAgent:
         )
 
     def train(
-        self, curriculum: CurriculumManager, num_rollouts: int, horizon: int = 2048
+        self,
+        curriculum: CurriculumManager,
+        num_rollouts: int,
+        horizon: int = 2048,
+        start_level: int = 0,
     ) -> None:
+        if 0 <= start_level < len(curriculum.tasks):
+            curriculum._task_idx = start_level
+
         agg_stats = {
             "pi_loss": [],
             "v_loss": [],
@@ -285,6 +292,7 @@ class PPOAgent:
             for k in ["success", "crash", "out_of_bounds", "timeout", "missing_target"]:
                 agg_stats[k] += stats[k]
 
+            # checkpointing + val loop
             if rollout % 100 == 0:
                 val_sr = self.validate(num_rollouts=4, horizon=horizon)
                 logging.info(f"Validation: Rollout {rollout}, SR: {val_sr:.2%}")
@@ -297,15 +305,18 @@ class PPOAgent:
                     if curriculum.step_down():
                         logging.info(f"[Curriculum] DOWN to Lvl {curriculum.task_idx}")
 
-                if prev_idx != curriculum.task_idx:
+                # auto save
+                torch.save(self.policy.state_dict(), "./models/policy_net.pth")
+                torch.save(self.value.state_dict(), "./models/value_net.pth")
+
+                # level up save
+                if prev_idx < curriculum.task_idx:
                     torch.save(
                         self.policy.state_dict(),
-                        f"./models/policy_lvl_{curriculum.task_idx}.pth",
+                        f"./models/policy_lvl_{prev_idx}.pth",
                     )
-                    if self.policy.log_std.sum() < -2.0:
-                        with torch.no_grad():
-                            self.policy.log_std.fill_(-1.0)
 
+            # aggregate stats from last 10 rollouts
             if rollout % 10 == 0:
                 avg_pi = np.mean(agg_stats["pi_loss"])
                 avg_v = np.mean(agg_stats["v_loss"])
@@ -343,10 +354,6 @@ class PPOAgent:
                     "total_episodes",
                 ]:
                     agg_stats[k] = 0
-
-            if rollout % 50 == 0:
-                torch.save(self.policy.state_dict(), "./models/policy_net.pth")
-                torch.save(self.value.state_dict(), "./models/value_net.pth")
 
     @torch.inference_mode()
     def validate(self, num_rollouts=4, horizon=2048):
@@ -407,7 +414,6 @@ def main():
         # force reset entropy (to around -1.2)
         # for the case when entropy collapses / explodes
         # but still want to reuse model (delete old file otherwise)
-        agent.ent_coef = 1e-4
         with torch.no_grad():
             agent.policy.log_std.fill_(-2.0)
 
