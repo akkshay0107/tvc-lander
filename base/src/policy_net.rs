@@ -21,20 +21,20 @@ impl PolicyNet {
         Ok(Self { model })
     }
 
-    /// Forward pass. Returns (mean, std) vectors.
+    /// Forward pass. Returns the mean vector.
     pub fn forward(
         &mut self,
         input: Vec<f32>,
         input_shape: Vec<usize>,
-    ) -> Result<(Vec<f32>, Vec<f32>), Box<dyn Error>> {
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
         let shape_tuple: Vec<usize> = input_shape; // tract compatible shape
         let input_array = tract_ndarray::ArrayD::from_shape_vec(shape_tuple, input)?;
         let input_tensor: Tensor = input_array.into();
 
         let result = self.model.run(tvec!(input_tensor.into()))?;
 
-        if result.len() != 2 {
-            return Err("Expected two outputs: mean and std".into());
+        if result.len() != 1 {
+            return Err("Expected one output: mean".into());
         }
 
         let mean = result[0]
@@ -43,13 +43,7 @@ impl PolicyNet {
             .unwrap()
             .to_vec();
 
-        let std = result[1]
-            .to_array_view::<f32>()?
-            .as_slice()
-            .unwrap()
-            .to_vec();
-
-        Ok((mean, std))
+        Ok(mean)
     }
 
     pub fn get_action(
@@ -57,7 +51,7 @@ impl PolicyNet {
         input: Vec<f32>,
         input_shape: Vec<usize>,
     ) -> Result<Vec<f32>, Box<dyn Error>> {
-        let (mean, _) = self.forward(input, input_shape)?;
+        let mean = self.forward(input, input_shape)?;
 
         // Apply tanh to mean
         let action: Vec<f32> = mean.into_iter().map(|x| x.tanh()).collect();
@@ -76,13 +70,13 @@ mod tests {
         let mut net = PolicyNet::new(&model_bytes).unwrap();
         let obs_dim = 6;
         let act_dim = 2;
-        let input_shape = vec![1, obs_dim];
-        let input = vec![0.0; obs_dim];
+        let n_frames = 4;
+        let input_shape = vec![1, obs_dim * n_frames];
+        let input = vec![0.0; obs_dim * n_frames];
 
-        let (mean, std) = net.forward(input, input_shape).unwrap();
+        let mean = net.forward(input, input_shape).unwrap();
         println!("Mean: {:?}", mean);
         assert_eq!(mean.len(), act_dim);
-        assert_eq!(std.len(), act_dim);
     }
 
     #[test]
@@ -91,8 +85,9 @@ mod tests {
         let mut net = PolicyNet::new(&model_bytes).unwrap();
         let obs_dim = 6;
         let act_dim = 2;
-        let input_shape = vec![1, obs_dim];
-        let input = vec![0.0; obs_dim];
+        let n_frames = 4;
+        let input_shape = vec![1, obs_dim * n_frames];
+        let input = vec![0.0; obs_dim * n_frames];
 
         let action = net.get_action(input, input_shape).unwrap();
         println!("Action: {:?}", action);

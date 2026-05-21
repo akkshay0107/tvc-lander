@@ -1,4 +1,4 @@
-use std::f32::consts::{PI, SQRT_2};
+use std::f32::consts::PI;
 
 use base::constants::*;
 use base::world::World;
@@ -7,11 +7,15 @@ use pyo3::types::PyDict;
 use rand::Rng;
 use rapier2d::na::Isometry2;
 use rapier2d::prelude::*;
+use rayon::prelude::*;
+
+const BASE_REWARD_SCALE: f32 = 10.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EpisodeStatus {
     InProgress,
     Success,
+    MissingTarget,
     Crash,
     OutOfBounds,
     Timeout,
@@ -22,6 +26,7 @@ impl EpisodeStatus {
         match self {
             EpisodeStatus::InProgress => "in_progress",
             EpisodeStatus::Success => "success",
+            EpisodeStatus::MissingTarget => "missing_target",
             EpisodeStatus::Crash => "crash",
             EpisodeStatus::OutOfBounds => "out_of_bounds",
             EpisodeStatus::Timeout => "timeout",
@@ -32,49 +37,44 @@ impl EpisodeStatus {
 #[pyclass]
 pub struct PyEnvironment {
     world: World,
-    prev_potential: f32,
+    prev_potentials: Vec<f32>,
     steps: u32,
-    tot_steps: u32,
     max_steps: u32,
     obs_dim: u32,
     act_dim: u32,
+    group_size: usize,
+    spawn_x_range: (f32, f32),
+    spawn_y_range: (f32, f32),
+    spawn_angle_range: (f32, f32),
 }
 
 #[pymethods]
 impl PyEnvironment {
     #[new]
-    pub fn new(max_steps: u32) -> Self {
-        let world = World::new();
+    pub fn new(max_steps: u32, group_size: usize) -> Self {
+        let world = World::new(group_size);
         Self {
             world,
-            prev_potential: 0.0,
+            prev_potentials: vec![0.0; group_size],
             steps: 0,
-            tot_steps: 0,
             max_steps,
             obs_dim: 6,
             act_dim: 2,
+            group_size,
+            spawn_x_range: (MAX_POS_X / 2.0, MAX_POS_X / 2.0),
+            spawn_y_range: (5.0, 5.0),
+            spawn_angle_range: (0.0, 0.0),
         }
     }
 
-    // world doesn't need a getter
     #[getter]
     pub fn get_steps(&self) -> u32 {
         self.steps
     }
 
     #[getter]
-    pub fn get_tot_steps(&self) -> u32 {
-        self.tot_steps
-    }
-
-    #[getter]
     pub fn get_max_steps(&self) -> u32 {
         self.max_steps
-    }
-
-    #[getter]
-    pub fn get_prev_potential(&self) -> f32 {
-        self.prev_potential
     }
 
     #[getter]
@@ -87,80 +87,90 @@ impl PyEnvironment {
         self.act_dim
     }
 
-    #[setter]
-    pub fn set_tot_steps(&mut self, tot_steps: u32) {
-        self.tot_steps = tot_steps;
+    #[getter]
+    pub fn get_group_size(&self) -> usize {
+        self.group_size
     }
 
-    pub fn reset(&mut self) -> PyResult<[f32; 6]> {
-        self.world = World::new();
+    pub fn set_spawn_x_range(&mut self, min: f32, max: f32) {
+        self.spawn_x_range = (min, max);
+    }
+
+    pub fn set_spawn_y_range(&mut self, min: f32, max: f32) {
+        self.spawn_y_range = (min, max);
+    }
+
+    pub fn set_spawn_angle_range(&mut self, min: f32, max: f32) {
+        self.spawn_angle_range = (min, max);
+    }
+
+    pub fn reset(&mut self) -> PyResult<Vec<[f32; 6]>> {
+        self.world = World::new(self.group_size);
         self.steps = 0;
 
-        let init_state = self._sample(); // Random valid state
-        self.prev_potential = self.calculate_potential(
-            init_state[0],
-            init_state[1],
-            init_state[2],
-            init_state[3],
-            init_state[4],
-            init_state[5],
-        );
+        let mut next_obs = Vec::with_capacity(self.group_size);
+        self.prev_potentials = Vec::with_capacity(self.group_size);
 
-        // Set the state to the rocket in the world
-        let rocket = self
-            .world
-            .rigid_body_set
-            .get_mut(self.world.rocket_body_handle)
-            .unwrap();
-        rocket.set_position(
-            Isometry2::new(vector![init_state[0], init_state[1]], init_state[2]),
-            true,
-        );
-        rocket.set_linvel(vector![init_state[3], init_state[4]], true);
-        rocket.set_angvel(init_state[5], true);
+        for &handle in &self.world.rocket_handles {
+            let state = self._sample();
+            let potential = self
+                ._calculate_potential(state[0], state[1], state[2], state[3], state[4], state[5]);
+            self.prev_potentials.push(potential);
 
-        Ok(self._normalize(init_state))
+            let rocket = self.world.rigid_body_set.get_mut(handle).unwrap();
+            rocket.set_position(Isometry2::new(vector![state[0], state[1]], state[2]), true);
+            rocket.set_linvel(vector![state[3], state[4]], true);
+            rocket.set_angvel(state[5], true);
+
+            next_obs.push(self._normalize(state));
+        }
+
+        Ok(next_obs)
     }
 
-    pub fn step(&mut self, action: [f32; 2]) -> PyResult<([f32; 6], f32, bool, &'static str)> {
-        // Run the physics step in rapier for the next state
-        let [thrust, gimbal_angle] = action;
-        self.world.apply_thruster_forces(thrust, gimbal_angle);
+    pub fn step(
+        &mut self,
+        actions: Vec<[f32; 2]>,
+    ) -> PyResult<(Vec<[f32; 6]>, Vec<f32>, Vec<bool>, Vec<&'static str>)> {
+        self.world.apply_multi_thruster_forces(&actions);
         self.world.step();
         self.steps += 1;
 
-        let (x, y, theta) = self.world.get_rocket_state();
-        let (vx, vy, omega) = self.world.get_rocket_dynamics();
-        let next_state = self._normalize([x, y, theta, vx, vy, omega]);
+        let states = self.world.get_multi_rocket_state();
+        let dynamics = self.world.get_multi_rocket_dynamics();
 
-        let (reason, done) = self._episode_status(x, y, theta, vx, vy, omega);
-        let reward = self.calculate_reward(x, y, theta, vx, vy, omega);
+        let results: Vec<([f32; 6], f32, f32, bool, &'static str)> = (0..self.group_size)
+            .into_par_iter()
+            .map(|i| {
+                let (x, y, theta) = states[i];
+                let (vx, vy, omega) = dynamics[i];
 
-        Ok((next_state, reward, done, reason))
+                let obs = self._normalize([x, y, theta, vx, vy, omega]);
+                let (reason, done) = self._episode_status(x, y, theta, vx, vy, omega);
+                let (reward, potential) = self._calculate_reward(i, x, y, theta, vx, vy, omega);
+
+                (obs, reward, potential, done, reason)
+            })
+            .collect();
+
+        let mut next_obs = Vec::with_capacity(self.group_size);
+        let mut rewards = Vec::with_capacity(self.group_size);
+        let mut dones = Vec::with_capacity(self.group_size);
+        let mut reasons = Vec::with_capacity(self.group_size);
+
+        for (i, (obs, reward, potential, done, reason)) in results.into_iter().enumerate() {
+            next_obs.push(obs);
+            rewards.push(reward);
+            dones.push(done);
+            reasons.push(reason);
+            self.prev_potentials[i] = potential;
+        }
+
+        Ok((next_obs, rewards, dones, reasons))
     }
 
-    fn calculate_potential(&self, x: f32, y: f32, theta: f32, vx: f32, vy: f32, omega: f32) -> f32 {
-        let [nx, ny, ntheta, nvx, nvy, nomega] = self._normalize([x, y, theta, vx, vy, omega]);
-
-        // center is (max_x/2, 0) => potential should be min there
-        let ndist = nx.powi(2) + ny.powi(2);
-        let dist_score = 1.0 - (ndist / 2.0);
-
-        // slow velocity preferred
-        let speed = (nvx.powi(2) + nvy.powi(2)).sqrt();
-        let speed_score = 1.0 - (speed / SQRT_2).min(1.0);
-
-        // reward being upright and not spinning too much
-        let angle_norm = (ntheta.powi(2) + nomega.powi(2).min(1.0)).sqrt(); // [0, sqrt2]
-        let angle_score = 1.0 - (angle_norm / SQRT_2);
-
-        let potential = 0.5 * dist_score + 0.2 * angle_score + 0.3 * speed_score;
-
-        100.0 * potential
-    }
-
-    fn calculate_reward(
-        &mut self,
+    fn _calculate_potential(
+        &self,
         x: f32,
         y: f32,
         theta: f32,
@@ -168,22 +178,65 @@ impl PyEnvironment {
         vy: f32,
         omega: f32,
     ) -> f32 {
-        let current_potential = self.calculate_potential(x, y, theta, vx, vy, omega);
-        let shaping_reward = current_potential - self.prev_potential;
-        self.prev_potential = current_potential;
+        let [nx, ny, ntheta, nvx, nvy, nomega] = self._normalize([x, y, theta, vx, vy, omega]);
 
-        let mut terminal_reward = 0.0;
-        let base_success = 100.0;
+        // bias towards x
+        let dist_sq = 3.0 * nx.powi(2) + ny.powi(2);
+        let vel_sq = nvx.powi(2) + nvy.powi(2);
+        let angle_sq = ntheta.powi(2) + nomega.powi(2);
 
-        if self._is_crash_landing(x, y, theta, vx, vy, omega) || self._is_oob(x, y) {
-            terminal_reward = -base_success;
-        } else if self._is_successful_landing(x, y, theta, vx, vy, omega) {
-            let ndx = (2.0 * x - MAX_POS_X) / MAX_POS_X;
-            terminal_reward = base_success * (-2.0 * ndx.powi(2)).exp(); // gaussian reward
-        }
+        // normalize scores
+        let dist_score = (1.0 - (dist_sq / 4.0)).max(0.0);
+        let vel_score = (1.0 - (vel_sq / 2.0)).max(0.0);
+        let angle_score = (1.0 - (angle_sq / 2.0)).max(0.0);
 
-        let time_penalty = 5e-3;
-        shaping_reward + terminal_reward - time_penalty
+        let potential = 0.5 * dist_score + 0.2 * vel_score + 0.3 * angle_score;
+
+        BASE_REWARD_SCALE * potential
+    }
+
+    fn _calculate_reward(
+        &self,
+        idx: usize,
+        x: f32,
+        y: f32,
+        theta: f32,
+        vx: f32,
+        vy: f32,
+        omega: f32,
+    ) -> (f32, f32) {
+        let current_potential = self._calculate_potential(x, y, theta, vx, vy, omega);
+        let shaping_reward = current_potential - self.prev_potentials[idx];
+
+        let landed = y <= _MIN_POS_Y;
+        let terminal_reward = if self._is_oob(x, y) {
+            -BASE_REWARD_SCALE
+        } else if !landed {
+            0.0
+        } else if self._is_crash(theta, vx, vy, omega) {
+            -BASE_REWARD_SCALE
+        } else {
+            let nx = (2.0 * x - MAX_POS_X) / MAX_POS_X;
+            let centering_bonus = BASE_REWARD_SCALE * (1.0 - nx.abs());
+            let precision_bonus = BASE_REWARD_SCALE * (-nx.powi(2)).exp();
+
+            let left_flag = (MAX_POS_X / 2.0) - FLAG_DELTA;
+            let right_flag = (MAX_POS_X / 2.0) + FLAG_DELTA;
+            let tot = BASE_REWARD_SCALE + 0.5 * centering_bonus + 0.5 * precision_bonus;
+
+            if x < left_flag || x > right_flag {
+                0.3 * tot
+            } else {
+                tot
+            }
+        };
+
+        let time_penalty = 1e-3;
+
+        (
+            shaping_reward + terminal_reward - time_penalty,
+            current_potential,
+        )
     }
 
     fn _normalize(&self, obs: [f32; 6]) -> [f32; 6] {
@@ -200,33 +253,10 @@ impl PyEnvironment {
 
     fn _sample(&self) -> [f32; 6] {
         let mut rng = rand::rng();
-
-        let center_x = MAX_POS_X / 2.0;
-
-        let (spawn_width, box_bottom, box_top) = if self.tot_steps < 100_000 {
-            (0.0, 5.0, 5.0)
-        } else if self.tot_steps < 250_000 {
-            (5.0, 10.0, 20.0)
-        } else if self.tot_steps < 500_000 {
-            (10.0, 15.0, 30.0)
-        } else if self.tot_steps < 1_000_000 {
-            (20.0, 20.0, 35.0)
-        } else {
-            (35.0, 20.0, 42.0)
-        };
-
-        let box_left = center_x - spawn_width;
-        let box_right = center_x + spawn_width;
-
-        let start_x: f32 = rng.random_range(box_left..=box_right);
-        let start_y: f32 = rng.random_range(box_bottom..=box_top);
-        let start_angle: f32 = rng.random_range(-MAX_ANGLE_DEFLECTION..=MAX_ANGLE_DEFLECTION);
-
-        // From the implememtation in base/src/world.rs
-        // rotation is prevented when dragging, and velocities
-        // is forcefully set to 0 when the drag ends
-        // All starting sequences must have v & omega = 0
-
+        let start_x: f32 = rng.random_range(self.spawn_x_range.0..=self.spawn_x_range.1);
+        let start_y: f32 = rng.random_range(self.spawn_y_range.0..=self.spawn_y_range.1);
+        let start_angle: f32 =
+            rng.random_range(self.spawn_angle_range.0..=self.spawn_angle_range.1);
         [start_x, start_y, start_angle, 0.0, 0.0, 0.0]
     }
 
@@ -234,33 +264,13 @@ impl PyEnvironment {
         Ok(self._sample())
     }
 
-    fn _is_crash_landing(&self, _x: f32, y: f32, theta: f32, vx: f32, vy: f32, omega: f32) -> bool {
-        let landed = y <= _MIN_POS_Y;
+    fn _is_crash(&self, theta: f32, vx: f32, vy: f32, omega: f32) -> bool {
         let bad_angle = theta.abs() > MAX_LANDING_ANGLE;
         let fast_land = vy.abs() > MAX_LANDING_VY;
         let fast_horiz = vx.abs() > MAX_LANDING_VX;
         let fast_spin = omega.abs() > MAX_LANDING_ANGULAR_VELOCITY;
 
-        landed && (bad_angle || fast_land || fast_horiz || fast_spin)
-    }
-
-    fn _is_successful_landing(
-        &self,
-        x: f32,
-        y: f32,
-        theta: f32,
-        vx: f32,
-        vy: f32,
-        omega: f32,
-    ) -> bool {
-        let landed = y <= _MIN_POS_Y;
-        let in_x_range = x > 0.0 && x < MAX_POS_X;
-        let gentle_angle = theta.abs() <= MAX_LANDING_ANGLE;
-        let gentle_vy = vy.abs() <= MAX_LANDING_VY;
-        let gentle_vx = vx.abs() <= MAX_LANDING_VX;
-        let gentle_omega = omega.abs() <= MAX_LANDING_ANGULAR_VELOCITY;
-
-        landed && in_x_range && gentle_angle && gentle_vy && gentle_vx && gentle_omega
+        bad_angle || fast_land || fast_horiz || fast_spin
     }
 
     fn _is_oob(&self, x: f32, y: f32) -> bool {
@@ -276,22 +286,32 @@ impl PyEnvironment {
         vy: f32,
         omega: f32,
     ) -> (&'static str, bool) {
-        let status = if self._is_successful_landing(x, y, theta, vx, vy, omega) {
-            EpisodeStatus::Success
-        } else if self._is_crash_landing(x, y, theta, vx, vy, omega) {
-            EpisodeStatus::Crash
-        } else if self._is_oob(x, y) {
+        let landed = y <= _MIN_POS_Y;
+
+        let status = if self._is_oob(x, y) {
             EpisodeStatus::OutOfBounds
         } else if self.steps >= self.max_steps {
             EpisodeStatus::Timeout
-        } else {
+        } else if !landed {
             EpisodeStatus::InProgress
+        } else {
+            let left_flag = (MAX_POS_X / 2.0) - FLAG_DELTA;
+            let right_flag = (MAX_POS_X / 2.0) + FLAG_DELTA;
+            if self._is_crash(theta, vx, vy, omega) {
+                EpisodeStatus::Crash
+            } else if left_flag <= x && x <= right_flag {
+                EpisodeStatus::Success
+            } else {
+                EpisodeStatus::MissingTarget
+            }
         };
+
         (status.as_str(), status != EpisodeStatus::InProgress)
     }
 
     pub fn render_info(&self, py: Python) -> PyResult<PyObject> {
-        let (rocket_x, rocket_y, rocket_angle) = self.world.get_rocket_state();
+        let states = self.world.get_multi_rocket_state();
+        let (rocket_x, rocket_y, rocket_angle) = states[0]; // Render the first one for simplicity
 
         let state_dict = PyDict::new_bound(py);
         state_dict.set_item("rocket_x", rocket_x)?;

@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 
 pub const MAX_POS_X: f32 = 80.0; // Min pos x is 0
 pub const _MIN_POS_Y: f32 = 2.0; // COM of vertical rocket is at 2.0 when it touches the ground
-pub const MAX_POS_Y: f32 = 45.0;
+pub const MAX_POS_Y: f32 = 40.0;
 pub const MAX_ANGLE_DEFLECTION: f32 = PI / 12.0; // 15 degrees
 pub const GROUND_THRESHOLD: f32 = 1.999; // Slightly under min possible y
 
@@ -16,3 +16,5 @@ pub const MAX_THRUST: f32 = 20.0; // Thruster can offset gravity
 
 pub const ROCKET_WIDTH_M: f32 = 2.0;
 pub const ROCKET_HEIGHT_M: f32 = 4.0;
+
+pub const FLAG_DELTA: f32 = 10.0;

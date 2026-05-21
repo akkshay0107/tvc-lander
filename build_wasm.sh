@@ -55,7 +55,11 @@ done
 
 # Restore positionals
 set -- "${POSITIONAL[@]}"
-[ $# -ne 1 ] && die "too many arguments provided"
+if [ $# -eq 0 ]; then
+    die "missing PROJECT_NAME argument"
+elif [ $# -gt 1 ]; then
+    die "too many arguments provided"
+fi
 
 PROJECT_NAME=$1
 
@@ -67,75 +71,104 @@ HTML=$(
 		<head>
 		    <meta charset="utf-8">
 		    <title>${PROJECT_NAME}</title>
-		    <style>
-		        html,
-		        body,
-		        canvas {
-		            margin: 0px;
-		            padding: 0px;
-		            width: 100%;
-		            height: 100%;
-		            overflow: hidden;
-		            position: absolute;
-		            z-index: 0;
-		        }
-                #run-container {
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    height: 100%;
-                    flex-direction: column;
-                    font-family: sans-serif;
-                    text-align: center;
-                }
-                #run-container h1 {
-                    margin-top: 0;
-                }
-                #run-container p {
-                    margin-bottom: 1.5em;
-                    max-width: 600px;
-                }
-                #run-container button {
-                    font-size: 1.2em;
-                    padding: 10px 20px;
-                    cursor: pointer;
-                }
-		    </style>
-		</head>
-		<body style="margin: 0; padding: 0; height: 100vh; width: 100vw;">
-		    <canvas id="glcanvas" tabindex='1' hidden></canvas>
-		    <script src="https://not-fl3.github.io/miniquad-samples/mq_js_bundle.js"></script>
-		    <script type="module">
-		        import init, { set_wasm } from "./${PROJECT_NAME}.js?v=${BUILD_ID}";
-		        async function impl_run() {
-		            let wbg = await init();
-		            miniquad_add_plugin({
-		                register_plugin: (a) => (a.wbg = wbg),
-		                on_init: () => set_wasm(wasm_exports),
-		                version: "0.0.1",
-		                name: "wbg",
-		            });
-		            load("./${PROJECT_NAME}_bg.wasm?v=${BUILD_ID}");
-		        }
-		        window.run = function() {
-		            document.getElementById("run-container").remove();
-		            document.getElementById("glcanvas").removeAttribute("hidden");
-		            document.getElementById("glcanvas").focus();
-		            impl_run();
-		        }
-		    </script>
-		    <div id="run-container">
-                <h1>tvc-lander</h1>
-                <p>
-                    This is a simulation of a rocket landing using a Proximal Policy Optimization (PPO) agent for thrust vector control.
-                    The agent will try to land the rocket safely on the landing pad.
-                </p>
-                <p>
-                    Click and drag the rocket to move it to a new position and watch the agent attempt to recover and land.
-                </p>
-		        <button onclick="run()">Run Sim</button>
-		    </div>
-		</body>
+		<style>
+		    html,
+		    body {
+		        margin: 0px;
+		        padding: 0px;
+		        width: 100%;
+		        height: 100%;
+		        overflow: hidden;
+		        background-color: #050505;
+		        display: flex;
+		        justify-content: center;
+		        align-items: center;
+		        font-family: sans-serif;
+		    }
+		    canvas {
+		        margin: 0px;
+		        padding: 0px;
+		        display: block;
+		        width: 95vw;
+		        height: auto;
+		        max-height: 95vh;
+		        max-width: calc(95vh * 16 / 9);
+		        aspect-ratio: 16 / 9;
+		        image-rendering: -webkit-optimize-contrast;
+		        image-rendering: crisp-edges;
+		        background-color: black;
+		    }
+		    #run-container {
+		        display: flex;
+		        justify-content: center;
+		        align-items: center;
+		        height: 100%;
+		        width: 100%;
+		        flex-direction: column;
+		        text-align: center;
+		        color: white;
+		        background-color: #050505;
+		        position: absolute;
+		        top: 0;
+		        left: 0;
+		        z-index: 10;
+		    }
+		    #run-container h1 {
+		        margin-top: 0;
+		    }
+		    #run-container p {
+		        margin-bottom: 1.5em;
+		        max-width: 600px;
+		        padding: 0 20px;
+		    }
+		    #run-container button {
+		        font-size: 1.2em;
+		        padding: 10px 20px;
+		        cursor: pointer;
+		        background: #333;
+		        color: white;
+		        border: 1px solid #555;
+		        border-radius: 4px;
+		    }
+		    #run-container button:hover {
+		        background: #444;
+		    }
+		</style>
+	</head>
+	<body>
+	    <canvas id="glcanvas" tabindex='1' hidden></canvas>
+	    <script src="https://not-fl3.github.io/miniquad-samples/mq_js_bundle.js"></script>
+	    <script type="module">
+	        import init, { set_wasm } from "./${PROJECT_NAME}.js?v=${BUILD_ID}";
+	        async function impl_run() {
+	            let wbg = await init();
+	            miniquad_add_plugin({
+	                register_plugin: (a) => (a.wbg = wbg),
+	                on_init: () => set_wasm(wasm_exports),
+	                version: "0.0.1",
+	                name: "wbg",
+	            });
+	            load("./${PROJECT_NAME}_bg.wasm?v=${BUILD_ID}");
+	        }
+	        window.run = function() {
+	            document.getElementById("run-container").style.display = "none";
+	            document.getElementById("glcanvas").removeAttribute("hidden");
+	            document.getElementById("glcanvas").focus();
+	            impl_run();
+	        }
+	    </script>
+	    <div id="run-container">
+	        <h1>tvc-lander</h1>
+	        <p>
+	            This is a simulation of a rocket landing using a Proximal Policy Optimization (PPO) agent for thrust vector control.
+	            The agent will try to land the rocket safely on the landing pad.
+	        </p>
+	        <p>
+	            Click and drag the rocket to move it to a new position and watch the agent attempt to recover and land.
+	        </p>
+	        <button onclick="run()">Run Sim</button>
+	    </div>
+	</body>
 		</html>
 	END
 )

@@ -2,6 +2,12 @@
 .*
 __pycache__
 /dist
+*.log
+*.pth
+*.cpy
 !.github
 !.gitignore
-training_log*
+
+# baseline controller
+*.npz
+*control.py

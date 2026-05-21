@@ -1,4 +1,5 @@
-use crate::world::pixels_per_meter;
+use crate::constants::FLAG_DELTA;
+use crate::world::{ground_y_px, pixels_per_meter};
 use macroquad::prelude::*;
 
 pub const PARALLAX_SCROLL_SPEED: f32 = 0.08;
@@ -14,26 +15,27 @@ pub struct Game {
 impl Game {
     pub fn new() -> Self {
         let mut stars = Vec::new();
+        let ground_y = ground_y_px();
         for _ in 0..50 {
             let x = rand::gen_range(0.0, screen_width());
-            let y = rand::gen_range(0.0, screen_height() * 0.5); // Stars only in upper 50% of screen
+            let y = rand::gen_range(0.0, ground_y); // Stars only in sky
             let radius = rand::gen_range(1.0, 2.0);
             stars.push((x, y, radius));
         }
 
         let rocket_x = screen_width() / 2.0;
-        let ground_y = screen_height() * 0.8;
-        let rocket = crate::rocket_sprite::RocketSprite::new(rocket_x, ground_y);
+        let rocket = crate::rocket_sprite::RocketSprite::new(rocket_x, ground_y / 2.0);
         Self { stars, rocket }
     }
 
     pub fn update(&mut self) {
         // Parallax effect implementation
+        let ground_y = ground_y_px();
         for star in self.stars.iter_mut() {
             star.0 -= PARALLAX_SCROLL_SPEED;
             if star.0 < 0.0 {
                 star.0 = screen_width();
-                star.1 = rand::gen_range(0.0, screen_height() * 0.5);
+                star.1 = rand::gen_range(0.0, ground_y);
             }
         }
     }
@@ -41,8 +43,9 @@ impl Game {
     pub fn draw_space_atmos(&self) {
         let screen_w = screen_width();
         let screen_h = screen_height();
+        let ground_y = ground_y_px();
         let num_steps = 50;
-        let strip_height = screen_h / num_steps as f32;
+        let strip_height = ground_y / num_steps as f32;
 
         let top_color = Color::new(0.05, 0.02, 0.15, 1.0); // Deep purple
         let mid_color = Color::new(0.02, 0.05, 0.25, 1.0); // Dark blue
@@ -76,12 +79,23 @@ impl Game {
 
             draw_rectangle(0.0, y, screen_w, strip_height + 1.0, color);
         }
+
+        // Draw deep space below ground
+        if screen_h > ground_y {
+            draw_rectangle(
+                0.0,
+                ground_y,
+                screen_w,
+                screen_h - ground_y,
+                Color::new(0.01, 0.02, 0.05, 1.0),
+            );
+        }
     }
 
     pub fn draw_ground(&self) {
         let screen_w = screen_width();
         let screen_h = screen_height();
-        let ground_y = screen_h * 0.8;
+        let ground_y = ground_y_px();
 
         let base_color = Color::from_rgba(74, 48, 30, 255);
         let shadow_color = Color::from_rgba(57, 36, 23, 255);
@@ -134,8 +148,7 @@ impl Game {
         let dist_from_center = dist_from_center_m * ppm;
 
         let screen_w = screen_width();
-        let screen_h = screen_height();
-        let ground_y = screen_h * 0.8;
+        let ground_y = ground_y_px();
         let center_x = screen_w / 2.0;
 
         let pole_height = 4.0 * ppm;
@@ -184,6 +197,6 @@ impl Game {
         }
 
         self.draw_ground();
-        self.draw_landing_flags(10.0);
+        self.draw_landing_flags(FLAG_DELTA);
     }
 }

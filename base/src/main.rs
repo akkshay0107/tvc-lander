@@ -4,9 +4,18 @@ use base::world::{World, pixel_to_world, world_to_pixel};
 use macroquad::prelude::*;
 use rapier2d::prelude::*;
 
-#[macroquad::main("Uncontrolled Sim")]
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "TVC Lander - Uncontrolled".to_owned(),
+        window_width: 1600,
+        window_height: 900,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
 async fn main() {
-    let mut world = World::new();
+    let mut world = World::new(1);
     let mut game = Game::new();
 
     loop {
